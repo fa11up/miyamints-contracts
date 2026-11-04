@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import { SafeTransferLib } from "solady/utils/SafeTransferLib.sol";
 import {UniAlignmentVault} from "../../src/vaults/uni/UniAlignmentVault.sol";
 import {IVaultPriceValidator} from "../../src/interfaces/IVaultPriceValidator.sol";
 
@@ -18,6 +19,10 @@ contract TestableUniAlignmentVault is UniAlignmentVault {
         lastTickLower = tickLower;
         lastTickUpper = tickUpper;
         liquidityUnits = uint128((amount0 + amount1) / 2);
+        // A real LP add takes the assets out of the vault.
+        (bool ok,) = payable(address(0xdead)).call{ value: amount0 }("");
+        require(ok, "eth sink");
+        SafeTransferLib.safeTransfer(alignmentToken, address(0xdead), amount1);
     }
 
     /// @notice Simulate protocol fee accrual for testing withdrawProtocolFees happy path.

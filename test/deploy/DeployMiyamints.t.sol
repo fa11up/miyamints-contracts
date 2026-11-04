@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import { UniswapVaultPriceValidator } from "../../src/peripherals/UniswapVaultPriceValidator.sol";
 import { Test } from "forge-std/Test.sol";
 import { DeployMiyamints } from "../../script/DeployMiyamints.s.sol";
 import { MiyaRegistry } from "../../src/registry/MiyaRegistry.sol";
@@ -23,6 +24,9 @@ import { BalanceDelta } from "v4-core/types/BalanceDelta.sol";
 import { Currency } from "v4-core/types/Currency.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
 import { TickMath } from "v4-core/libraries/TickMath.sol";
+import { StateLibrary } from "v4-core/libraries/StateLibrary.sol";
+import { PoolIdLibrary } from "v4-core/types/PoolId.sol";
+import { FixedPointMathLib } from "solady/utils/FixedPointMathLib.sol";
 
 /// @dev Seeds the hookless ETH/INFER pool the launch needs, as the real launch will before deploying.
 contract InferPoolSeeder is IUnlockCallback {
@@ -68,6 +72,9 @@ contract InferPoolSeeder is IUnlockCallback {
 ///         RPC: MAINNET_RPC_URL (default https://ethereum-rpc.publicnode.com); FORK_BLOCK pins a block.
 ///         Skipped (not failed) when the RPC is unreachable or SKIP_FORK_TESTS=true.
 contract DeployMiyamintsForkTest is Test {
+    using StateLibrary for IPoolManager;
+    using PoolIdLibrary for PoolKey;
+
     address constant TREASURY = 0x6Ac8fF96Fb8DCF5d79A8eF1E59D9AC23f2BD27Bc;
     address constant INFER = 0x53d0eA0A685220718Dc6a0a6e4617194C6F37921;
 
@@ -193,7 +200,7 @@ contract DeployMiyamintsForkTest is Test {
         });
         vm.prank(artist);
         address inst = f.createInstance(salt, p);
-        assertEq(inst, f.computeInstanceAddress(salt));
+        assertEq(inst, f.computeInstanceAddress(salt, artist));
         ERC721AuctionInstance a = ERC721AuctionInstance(payable(inst));
 
         vm.prank(artist);
@@ -226,7 +233,7 @@ contract DeployMiyamintsForkTest is Test {
         });
         vm.prank(artist);
         ERC1155Instance music = ERC1155Instance(payable(f.createInstance(salt, p)));
-        assertEq(address(music), f.computeInstanceAddress(salt));
+        assertEq(address(music), f.computeInstanceAddress(salt, artist));
         assertEq(MiyaRegistry(d.registry).factoryOf(address(music)), d.erc1155Factory);
 
         // editionArgs(): (title, priceWei, supply, metadataURI, model, 0, 0); open edition = UNLIMITED, supply 0
@@ -272,4 +279,108 @@ contract DeployMiyamintsForkTest is Test {
         assertEq(v.totalPendingETH(), 0);
         assertGt(v.benefactorShares(address(drop)), 0, "drop holds vault shares");
     }
+
+    // ── audit round 1: conversions after the first ───────────────────────────
+
+    address constant Z_ROUTER = 0x000000000000FB114709235f1ccBFfb925F600e4;
+    IPoolManager constant MANAGER = IPoolManager(0x000000000004444c5dc75cB358380D2e3dE08A90);
+
+    /// @dev Contribute and convert as the keeper.
+    function _contributeAndConvert(uint256 amount) internal returns (UniAlignmentVault v) {
+        v = UniAlignmentVault(payable(d.defaultVault));
+        vm.deal(buyer, amount);
+        vm.prank(buyer);
+        (bool ok,) = address(v).call{ value: amount }("");
+        assertTrue(ok);
+        vm.prank(keeper);
+        v.convertAndAddLiquidity(1, 1);
+    }
+
+    /// @dev ETH in the vault that no share, fee balance or pending batch accounts for.
+    function _unaccountedEth(UniAlignmentVault v) internal view returns (uint256) {
+        uint256 owed = v.totalPendingETH() + v.accumulatedFees() - v.totalFeesClaimed() + v.accumulatedProtocolFees();
+        return address(v).balance - owed;
+    }
+
+    /// @dev Value of the tokens the vault holds beyond pending fee tokens, in ETH at the pool's current price.
+    function _unusedTokenValue(UniAlignmentVault v) internal view returns (uint256) {
+        uint256 tokens = ERC20Balance(INFER).balanceOf(address(v)) - v.pendingFeeTokens();
+        PoolKey memory key = PoolKey(Currency.wrap(address(0)), Currency.wrap(INFER), 10000, 200, IHooks(address(0)));
+        (uint160 sqrtPriceX96,,,) = StateLibrary.getSlot0(MANAGER, key.toId());
+        return FixedPointMathLib.fullMulDiv(FixedPointMathLib.fullMulDiv(tokens, 1 << 96, sqrtPriceX96), 1 << 96, sqrtPriceX96);
+    }
+
+    /// Leftovers must settle at a small share of one batch however many conversions run: small batches leave ETH over
+    /// and large ones (here, far bigger than the pool) leave tokens, so run both.
+    function _assertLeftoversSettle(uint256 batch, uint256 rounds) internal {
+        UniAlignmentVault v;
+        for (uint256 i; i < rounds; ++i) {
+            v = _contributeAndConvert(batch);
+        }
+        assertLt(_unaccountedEth(v), batch / 50, "ETH left over");
+        assertLt(_unusedTokenValue(v), batch / 50, "tokens left over");
+    }
+
+    function test_fork_leftoversSettle_smallBatches() public onFork {
+        _assertLeftoversSettle(0.1 ether, 40);
+    }
+
+    function test_fork_leftoversSettle_largeBatches() public onFork {
+        _assertLeftoversSettle(10 ether, 12);
+    }
+
+    function test_fork_proportionIsAboutHalfForFullRange() public onFork {
+        UniAlignmentVault v = _contributeAndConvert(1 ether);
+        uint256 p = UniswapVaultPriceValidator(address(v.priceValidator())).calculateSwapProportion(
+            INFER, v.lastTickLower(), v.lastTickUpper(), address(MANAGER), keccak256(abi.encode(address(0), INFER, uint24(10000), int24(200), address(0)))
+        );
+        emit log_named_uint("proportion", p);
+        assertApproxEqRel(p, 5e17, 1e16);
+    }
+
+    function test_fork_oneWeiInRouterDoesNotBlockConversion() public onFork {
+        vm.deal(address(this), 1 ether);
+        (bool ok,) = Z_ROUTER.call{ value: 1 }("");
+        assertTrue(ok, "router accepts ETH");
+        _contributeAndConvert(1 ether);
+    }
+
+    function test_fork_dustV4PoolAtExtremeTickDoesNotBlockConversion() public onFork {
+        PoolKey memory dust = PoolKey(Currency.wrap(address(0)), Currency.wrap(INFER), 3000, 60, IHooks(address(0)));
+        MANAGER.initialize(dust, TickMath.getSqrtPriceAtTick(800_000));
+        // One wei of in-range liquidity, which anyone could add.
+        bytes32 slot = bytes32(uint256(keccak256(abi.encode(keccak256(abi.encode(dust)), uint256(6)))) + 3);
+        vm.store(address(MANAGER), slot, bytes32(uint256(1)));
+        _contributeAndConvert(1 ether);
+    }
+
+    function test_fork_dustV3PoolDoesNotBlockLaterConversions() public onFork {
+        _contributeAndConvert(1 ether);
+        // A v3 WETH/INFER pool with 1 wei of liquidity, 30 minutes old, at an arbitrary tick.
+        DustV3Pool dust = new DustV3Pool();
+        vm.mockCall(
+            UniswapVaultPriceValidator(address(UniAlignmentVault(payable(d.defaultVault)).priceValidator())).v3Factory(),
+            abi.encodeWithSignature("getPool(address,address,uint24)", address(UniswapVaultPriceValidator(address(UniAlignmentVault(payable(d.defaultVault)).priceValidator())).weth()), INFER, uint24(3000)),
+            abi.encode(address(dust))
+        );
+        _contributeAndConvert(1 ether);
+    }
+}
+
+/// @dev A v3 pool as anyone could set one up: dust liquidity and one old observation at the tick they chose.
+contract DustV3Pool {
+    function token0() external pure returns (address) { return 0x53d0eA0A685220718Dc6a0a6e4617194C6F37921; }
+    function token1() external pure returns (address) { return 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2; }
+    function liquidity() external pure returns (uint128) { return 1; }
+    function slot0() external pure returns (uint160, int24, uint16, uint16, uint16, uint8, bool) {
+        return (79228162514264337593543950336, 0, 0, 1, 1, 0, true);
+    }
+    function observe(uint32[] calldata) external pure returns (int56[] memory t, uint160[] memory l) {
+        t = new int56[](2);
+        l = new uint160[](2);
+    }
+}
+
+interface ERC20Balance {
+    function balanceOf(address) external view returns (uint256);
 }

@@ -55,9 +55,12 @@ contract MiyaPoolFactory {
     }
 
     function _detectKind(address collection) internal view returns (MiyaPool.Kind) {
-        if (_supports(collection, ERC721_ID)) return MiyaPool.Kind.ERC721;
-        if (_supports(collection, ERC1155_ID)) return MiyaPool.Kind.ERC1155;
-        revert UnsupportedCollection();
+        // ERC-165 detection: a contract answering true for everything would otherwise pass as anything.
+        if (!_supports(collection, 0x01ffc9a7) || _supports(collection, 0xffffffff)) revert UnsupportedCollection();
+        bool is721 = _supports(collection, ERC721_ID);
+        bool is1155 = _supports(collection, ERC1155_ID);
+        if (is721 == is1155) revert UnsupportedCollection();
+        return is721 ? MiyaPool.Kind.ERC721 : MiyaPool.Kind.ERC1155;
     }
 
     function _supports(address target, bytes4 id) internal view returns (bool) {

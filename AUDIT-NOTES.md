@@ -23,7 +23,7 @@ demonstrated each fixed bug on 88641a8; here they assert the fixed behaviour.
 ## What changed
 
 **H1** — `receive()` returns early while a transient flag (`_COLLECTING_SLOT`, TSTORE/TLOAD) is set; the flag
-wraps only the internal collection (`_claimVaultFees`) and the keeper's fee-token swap (`_convertPendingFeeTokens`). One TLOAD keeps 2300-gas
+wraps only the internal collection (`_claimVaultFees`) and the keeper's two swaps. One TLOAD keeps 2300-gas
 `transfer` senders working. Test: `test/vaults/UniAlignmentVaultRealV4.t.sol` (real v4 `PoolManager`; this file
 compiles as a separate solc 0.8.26 unit, see `foundry.toml`).
 
@@ -89,14 +89,69 @@ These were added after the findings above, so the internal audit did not cover t
 - **Metadata events**: `setMetadata` emits EIP-4906 `BatchMetadataUpdate(1, maxSupply)` and `supportsInterface` reports
   `0x49064906`. `ERC1155Instance.updateEditionMetadata` emits the standard `URI` event.
 
+## External audit round 1 (pools, vaults, registry and factories at a991e8c)
+
+Fixed, with regression tests. The vault findings were reproduced on a mainnet fork with the real zRouter and PoolManager
+(`test/deploy/DeployMiyamints.t.sol`) before fixing:
+
+- **Swap proportion mixed units** (High): `calculateSwapProportion` divided ETH wei by ETH wei plus token units, so every
+  conversion after the first swapped 35% or 65% and stranded about 30% of the batch. It now compares value: about 50%
+  for a full-range position at any price, still clamped to 35-65%.
+- **zRouter refund blocked conversions** (High): zRouter refunds its whole ETH balance to the payer after an ETH swap, so
+  1 wei sent to the router made `receive()` revert every conversion. The swap now runs in collecting mode.
+- **Leftovers** (Low): an LP add can't use every wei, and fees earned by the position net off what it pays in. Each
+  conversion now works from all the ETH and tokens the vault holds beyond what it owes, sizing the swap to count tokens
+  already held, so leftovers feed into the next batch and stay under 2% of a batch in the fork tests (40 small and 8
+  large batches). That batch gets a small windfall in LP shares, which can only earn yield. ETH sent to the vault
+  outside contributions ends up here too. Some leftover always remains in the vault until the next conversion.
+- **Price overflow, dust reference pools, TWAP orientation** (High x3): prices use `fullMulDiv`. A v3 or v4 pool only
+  counts as a reference with at least 10 ETH of virtual depth at its current price. `calculateSwapProportion` no longer
+  compares against a TWAP, which removes both the griefing path and the inverted comparison. `validatePrice` now only
+  compares v2 against v3 when both have depth: its v4 lookup, unreachable TWAP branch and v2-capacity check are gone,
+  because the vault only ever swaps through its own v4 pool (a dust v2 pair could otherwise block a thin v4 pool).
+- **`deployVault`** (Medium): owner only. A permissionless vault could carry a validator that blocks its conversions.
+- **Auction settlement gas** (Medium) and **pool reveal gas** (Low): the winner mint and reveal transfers have a gas cap,
+  and too little gas reverts instead of forcing a token into escrow. The largest reveal fits mainnet's transaction gas
+  cap at worst, so a recipient can't block the ordered queue.
+- **CREATE3 salts** (Medium): the auction and 1155 factories bind the salt to the creator and to the factory.
+- **Pool hardening** (Low): a second hook for a held id reverts, a safe mint into a pool reverts (it credited
+  `address(0)`), the pool can't be a recipient, kind detection follows ERC-165, and claiming an escrowed auction token
+  into a pool credits the winner.
+- **Parked vault cuts** (Low): they go with the next split on all three sale paths, so small ones add up past the
+  vault's minimum. A final residue under 0.001 ETH can stay parked if a collection never sells again.
+- **1155 `withdraw`** (Low): anyone can call it, matching the Drop, so the cuts never wait on the artist.
+
+Accepted or deferred:
+
+- **RANDOM pools on Robinhood Chain (4663) are not safe to offer.** The chain runs on Arbitrum's stack: `block.number` is
+  an estimate of the Ethereum block, `blockhash` is documented as "cryptographically insecure" and not to be relied on
+  for randomness, and the EIP-2935 lookup always fails there, so the window is 256 blocks. Mainnet is unaffected. RANDOM
+  needs a different source of randomness, or must stay off, before any 4663 deployment.
+- **Gating module**: it gates nothing even if configured: the no-password tier is open, and the "password" is a public
+  hash. `FREE_MINT_ONLY` and `claimFreeMint` bugs are latent behind it. It stays off at deploy and needs a redesign
+  before it is enabled.
+- **The depth floor measures virtual depth, not capital.** A narrow v3 position can meet it cheaply at a fake price. To
+  block anything, that also needs a v2 pair holding 10+ WETH of the griefer's own to disagree with. INFER has neither,
+  and a keeper can reset it by swapping the pool out of range.
+- **1155 `withdraw(amount)` can be front-run** now that anyone can call it: the artist's exact-amount transaction reverts,
+  a retry works, and no funds are at risk.
+- **500-participant cap griefing**: 500 small contributions can delay other collections' cuts (parked, not lost) until the
+  keeper converts. The keeper has to run a costly conversion, and the griefer's ETH becomes LP shares.
+- **Auction anti-snipe has no cap**: a high bidder can keep a line open by paying the increment and gas every window.
+  Anyone can outbid. Creators choose the increment.
+- **Info items left as they are**: a committer's own same-transaction deposits count toward its draw range; re-arming an
+  earlier commit can change a later pick; a collection that refuses by returning silently leaves an id untracked; a
+  pool's name and permit domain read the collection live; the Permit2 infinite allowance; token id `0xfbb67fda52d4bfb8bf`
+  can't be pooled; the registry owner can lower the alignment floor for future launches only; `DynamicPricingModule` is
+  accepted as a gating module; 1155 mints skip the receiver hook.
+
 ## Notes for the reviewer
 
-- **Keeper trust (M2).** A wrong or malicious keeper can pass low floors and lose value on conversions, or stop
-  converting (ETH and fee tokens wait; the owner can replace it). It cannot take principal or claims.
-- **`validatePrice` is a backstop, not a guarantee.** It cross-checks v2 against v3 only when v2 holds 10+ WETH, and v4
-  against a v3 TWAP only when no v3 pool exists, so a token with a v3 pool and a dust v2 pair gets no cross-check. Its
-  v3 lookup takes the first fee tier with nonzero liquidity (0.3%, 0.05%, 1%), so a dust pool in an earlier tier wins.
-  INFER has no v2 or v3 pool at all. Safety rests on the keeper's floors.
+- **Keeper trust (M2).** The keeper's floors are the only price protection. A malicious keeper, or whoever holds its
+  key, can sandwich its own conversion with low floors and take up to the whole batch being converted. It can also stop
+  converting (ETH and fee tokens wait; the owner can replace it). It cannot touch earlier LP positions or settled fees.
+- **`validatePrice` is a backstop, not a guarantee.** It cross-checks v2 against v3 only when both have real depth. INFER
+  has no v2 or v3 pool at all, so it checks nothing there. Safety rests on the keeper's floors.
 - **Default alignment token is INFER**, which needs a hookless ETH pool seeded before deployment (DEPLOY.md).
 - **RANDOM re-rolls remain**: a commit left unrevealed past the block-hash window is re-armed, and block producers can
   influence the hash. Both are documented in `MiyaPool.sol`.
@@ -105,8 +160,6 @@ These were added after the findings above, so the internal audit did not cover t
   conversion. Uncollected LP yield is not reflected in `getUnclaimedFees` until collected.
 - Shares per ETH now differ slightly between batches (each batch pays its own ≤1% reward); the share-ordering
   invariant tolerance accounts for this.
-- ETH sent to the vault by anyone other than via contributions/collection (e.g. `selfdestruct`) is unaccounted
-  surplus; it is never paid out as fees.
 
 ---
 

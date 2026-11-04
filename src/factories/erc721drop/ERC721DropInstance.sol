@@ -237,13 +237,16 @@ contract ERC721DropInstance is ERC721, ERC2981, Ownable, ReentrancyGuard {
         if (amount == 0) revert NothingToWithdraw();
         RevenueSplitLib.Split memory s = RevenueSplitLib.split(amount, protocolBps, alignmentBps);
         if (s.protocolCut != 0) SafeTransferLib.safeTransferETH(treasury, s.protocolCut);
+        // Parked cuts go with this one, so small ones add up past the vault's minimum.
+        uint256 cut = s.vaultCut + pendingVaultCut;
         uint256 sentToVault;
-        if (s.vaultCut != 0) {
-            try vault.receiveContribution{ value: s.vaultCut }(Currency.wrap(address(0)), s.vaultCut, address(this)) {
-                sentToVault = s.vaultCut;
+        if (cut != 0) {
+            pendingVaultCut = 0;
+            try vault.receiveContribution{ value: cut }(Currency.wrap(address(0)), cut, address(this)) {
+                sentToVault = cut;
             } catch {
-                pendingVaultCut += s.vaultCut;
-                emit VaultContributionFailed(s.vaultCut);
+                pendingVaultCut = cut;
+                emit VaultContributionFailed(cut);
             }
         }
         if (s.remainder != 0) SmartTransferLib.smartTransferETH(owner(), s.remainder, weth);

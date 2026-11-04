@@ -303,6 +303,24 @@ contract ERC721DropTest is Test {
         d.withdraw();
     }
 
+    function test_parkedVaultCutGoesWithTheNextSplit() public {
+        ERC721DropInstance d = _drop(100, 1000);
+        vm.warp(block.timestamp + 1 days);
+        vm.prank(carol);
+        d.mint{ value: PRICE }(1, 1, new bytes32[](0));
+        vault.setRejecting(true);
+        d.withdraw();
+        uint256 parked = d.pendingVaultCut();
+        assertGt(parked, 0);
+
+        vault.setRejecting(false);
+        vm.prank(carol);
+        d.mint{ value: PRICE }(1, 1, new bytes32[](0));
+        d.withdraw();
+        assertEq(d.pendingVaultCut(), 0);
+        assertEq(vault.received(), parked * 2);
+    }
+
     function test_rejectedVaultCutIsParkedNotRedirected() public {
         ERC721DropInstance d = _drop(100, 1000);
         vm.warp(block.timestamp + 1 days);

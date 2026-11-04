@@ -144,6 +144,124 @@ contract MiyaPoolTest is Test {
         factory.createPool(makeAddr("eoa"), MiyaPool.RedeemMode.TARGETED);
     }
 
+    // ── audit round 1 ────────────────────────────────────────────────────────
+
+    function test_factory_rejectsCollectionThatClaimsEverything() public {
+        ClaimsEverything c = new ClaimsEverything();
+        vm.expectRevert(MiyaPoolFactory.UnsupportedCollection.selector);
+        factory.createPool(address(c), MiyaPool.RedeemMode.RANDOM);
+    }
+
+    function test_factory_rejectsCollectionFailingTheErc165Probe() public {
+        Claims721AndInvalidId c = new Claims721AndInvalidId();
+        vm.expectRevert(MiyaPoolFactory.UnsupportedCollection.selector);
+        factory.createPool(address(c), MiyaPool.RedeemMode.RANDOM);
+    }
+
+    function test_safeMintIntoPoolReverts() public {
+        MiyaPool pool = _pool721(MiyaPool.RedeemMode.TARGETED);
+        SafeMint721 m = new SafeMint721();
+        MiyaPool p2 = MiyaPool(factory.createPool(address(m), MiyaPool.RedeemMode.TARGETED));
+        vm.expectRevert(MiyaPool.InvalidRecipient.selector);
+        m.safeMint(address(p2), 7);
+        assertEq(pool.totalSupply(), 0);
+    }
+
+    function test_secondHookForHeldIdCannotMintUnbackedTokens() public {
+        MiyaPool pool = _pool721(MiyaPool.RedeemMode.TARGETED);
+        vm.prank(alice);
+        pool.deposit(_ids(1), _none(), alice);
+        // The collection itself calling the hook again, as an admin transfer helper could.
+        vm.prank(address(nft));
+        vm.expectRevert(abi.encodeWithSelector(MiyaPool.AlreadyHeld.selector, 1));
+        pool.onERC721Received(address(nft), bob, 1, "");
+        assertEq(pool.totalSupply(), UNIT);
+    }
+
+    function test_poolCannotBeTheRecipient() public {
+        MiyaPool pool = _pool721(MiyaPool.RedeemMode.TARGETED);
+        vm.startPrank(alice);
+        pool.deposit(_ids(1), _none(), alice);
+        vm.expectRevert(MiyaPool.InvalidRecipient.selector);
+        pool.redeem(_ids(1), _none(), address(pool));
+        vm.stopPrank();
+
+        MiyaPool random = _pool721(MiyaPool.RedeemMode.RANDOM);
+        vm.startPrank(alice);
+        random.deposit(_ids(2), _none(), alice);
+        vm.expectRevert(MiyaPool.InvalidRecipient.selector);
+        random.commitRedeem(1, address(random));
+        vm.stopPrank();
+    }
+
+    function test_heldIdsClampsHugeCount() public {
+        MiyaPool pool = _pool721(MiyaPool.RedeemMode.TARGETED);
+        vm.prank(alice);
+        pool.deposit(_ids(1, 2, 3), _none(), alice);
+        assertEq(pool.heldIds(1, type(uint256).max).length, 2);
+    }
+
+    /// A recipient that burns gas through a collection's transfer callback must not block the queue.
+    function test_gasBurningRecipientCannotBlockQueue() public {
+        Notify721 n = new Notify721();
+        for (uint256 id = 1; id <= 6; ++id) n.mint(alice, id);
+        MiyaPool pool = MiyaPool(factory.createPool(address(n), MiyaPool.RedeemMode.RANDOM));
+        uint256[] memory ids = new uint256[](6);
+        for (uint256 i; i < 6; ++i) ids[i] = i + 1;
+        vm.startPrank(alice);
+        n.setApprovalForAll(address(pool), true);
+        pool.deposit(ids, _none(), alice);
+        pool.transfer(bob, UNIT);
+        uint256 c0 = pool.commitRedeem(5, address(new GasBurner()));
+        vm.stopPrank();
+        vm.prank(bob);
+        uint256 c1 = pool.commitRedeem(1, bob);
+        vm.roll(block.number + 2);
+
+        pool.revealRedeem{ gas: 10_000_000 }(c0);
+        assertEq(pool.nextRevealId(), c1, "queue moved past the burner");
+        pool.revealRedeem(c1);
+        assertEq(n.balanceOf(bob), 1);
+    }
+
+    /// Reveals are strictly ordered, so the largest commit must fit in one mainnet transaction (EIP-7825) at worst.
+    function test_largestRevealToGasBurnerFitsMainnetGasCap() public {
+        RefusingNotify721 n = new RefusingNotify721();
+        uint256[] memory ids = new uint256[](50);
+        for (uint256 i; i < 50; ++i) {
+            ids[i] = i + 1;
+            n.mint(alice, i + 1);
+        }
+        MiyaPool pool = MiyaPool(factory.createPool(address(n), MiyaPool.RedeemMode.RANDOM));
+        vm.startPrank(alice);
+        n.setApprovalForAll(address(pool), true);
+        pool.deposit(ids, _none(), alice);
+        address burner = address(new GasBurner());
+        n.setNotified(burner);
+        uint256 c = pool.commitRedeem(50, burner);
+        vm.stopPrank();
+        vm.roll(block.number + 2);
+
+        uint256 before = gasleft();
+        pool.revealRedeem{ gas: 16_777_216 }(c);
+        emit log_named_uint("reveal gas", before - gasleft());
+        assertEq(pool.nextRevealId(), c + 1);
+        // The worst case: every transfer burned its gas and failed, so every id also wrote an escrow entry.
+        for (uint256 i; i < 50; ++i) assertTrue(pool.escrowedTo(i + 1) != address(0));
+    }
+
+    function test_revealWithTooLittleGasRevertsInsteadOfEscrowing() public {
+        MiyaPool pool = _pool721(MiyaPool.RedeemMode.RANDOM);
+        vm.startPrank(alice);
+        pool.deposit(_ids(1), _none(), alice);
+        uint256 c = pool.commitRedeem(1, bob);
+        vm.stopPrank();
+        vm.roll(block.number + 2);
+        vm.expectRevert(MiyaPool.RevealGasTooLow.selector);
+        pool.revealRedeem{ gas: 200_000 }(c);
+        assertEq(pool.escrowedTo(1), address(0));
+    }
+
     function test_metadata() public {
         MiyaPool pool = _pool721(MiyaPool.RedeemMode.TARGETED);
         assertEq(pool.name(), "miya pool: miyamaker mini");
@@ -593,5 +711,54 @@ contract MiyaPoolTest is Test {
         pool.claimEscrowed(escrowed, elsewhere);
         assertEq(blocking.ownerOf(escrowed), elsewhere);
         assertEq(pool.escrowedTo(escrowed), address(0));
+    }
+}
+
+contract ClaimsEverything {
+    function supportsInterface(bytes4) external pure returns (bool) {
+        return true;
+    }
+}
+
+contract SafeMint721 is Mock721 {
+    function safeMint(address to, uint256 id) external {
+        _safeMint(to, id);
+    }
+}
+
+/// @dev A collection whose plain transferFrom notifies contract recipients and ignores failures.
+contract Notify721 is Mock721 {
+    function transferFrom(address from, address to, uint256 id) public payable override {
+        super.transferFrom(from, to, id);
+        if (to.code.length != 0) {
+            try GasBurner(payable(to)).onNotify() { } catch { }
+        }
+    }
+}
+
+contract GasBurner {
+    function onNotify() external pure {
+        while (true) { }
+    }
+}
+
+/// @dev Answers true for everything except ERC-1155, so only the ERC-165 probe can catch it.
+contract Claims721AndInvalidId {
+    function supportsInterface(bytes4 id) external pure returns (bool) {
+        return id != 0xd9b67a26;
+    }
+}
+
+/// @dev Calls contract recipients on transferFrom and lets their failure refuse the transfer.
+contract RefusingNotify721 is Mock721 {
+    address public notified;
+
+    function setNotified(address who) external {
+        notified = who;
+    }
+
+    function transferFrom(address from, address to, uint256 id) public payable override {
+        super.transferFrom(from, to, id);
+        if (to == notified) GasBurner(to).onNotify();
     }
 }

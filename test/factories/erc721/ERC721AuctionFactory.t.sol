@@ -2,8 +2,10 @@
 pragma solidity ^0.8.24;
 
 import {Test, console} from "forge-std/Test.sol";
+import {MiyaPool} from "../../../src/pools/MiyaPool.sol";
+import {MiyaPoolFactory} from "../../../src/pools/MiyaPoolFactory.sol";
 import {ERC721AuctionFactory} from "../../../src/factories/erc721/ERC721AuctionFactory.sol";
-import {ERC721AuctionInstance, DepositRequired, URIRequired, BidBelowMinimum, BidTooLow, AuctionExpired, AuctionNotEnded, NoBids, HasBids, NotEscrowedWinner, RenounceDisabled} from "../../../src/factories/erc721/ERC721AuctionInstance.sol";
+import {ERC721AuctionInstance, SettlementGasTooLow, DepositRequired, URIRequired, BidBelowMinimum, BidTooLow, AuctionExpired, AuctionNotEnded, NoBids, HasBids, NotEscrowedWinner, RenounceDisabled} from "../../../src/factories/erc721/ERC721AuctionInstance.sol";
 import {UniAlignmentVault} from "../../../src/vaults/uni/UniAlignmentVault.sol";
 import {MockEXECToken} from "../../mocks/MockEXECToken.sol";
 import {MockZRouter} from "../../mocks/MockZRouter.sol";
@@ -147,7 +149,7 @@ contract ERC721AuctionFactoryTest is Test {
 
     function test_computeInstanceAddress() public view {
         bytes32 salt = bytes32(uint256(1));
-        address predicted = factory.computeInstanceAddress(salt);
+        address predicted = factory.computeInstanceAddress(salt, address(this));
         assertTrue(predicted != address(0));
     }
 
@@ -680,6 +682,68 @@ contract ERC721AuctionFactoryTest is Test {
         assertEq(inst.escrowedWinner(1), address(0));
     }
 
+    /// Audit round 1: a winner that burns all the gas it gets must not make settlement unaffordable.
+    function test_SettleAuction_GasBurningWinnerSettlesAtNormalGas() public {
+        ERC721AuctionInstance inst = _createDefaultInstance();
+        vm.prank(artist);
+        inst.queuePiece{value: 0.1 ether}("ipfs://piece1");
+        GasBurningBidder bidder = new GasBurningBidder();
+        vm.deal(address(bidder), 10 ether);
+        bidder.bid(address(inst), 1, 0.2 ether);
+        vm.warp(inst.getAuction(1).endTime);
+
+        inst.settleAuction{gas: 2_000_000}(1);
+        assertTrue(inst.getAuction(1).settled);
+        assertEq(inst.escrowedWinner(1), address(bidder));
+    }
+
+    function test_SettleAuction_TooLittleGasRevertsInsteadOfEscrowing() public {
+        ERC721AuctionInstance inst = _createDefaultInstance();
+        vm.prank(artist);
+        inst.queuePiece{value: 0.1 ether}("ipfs://piece1");
+        address winner = makeAddr("winner");
+        vm.deal(winner, 1 ether);
+        vm.prank(winner);
+        inst.createBid{value: 0.2 ether}(1, "");
+        vm.warp(inst.getAuction(1).endTime);
+
+        vm.expectRevert(SettlementGasTooLow.selector);
+        inst.settleAuction{gas: 500_000}(1);
+    }
+
+    /// Audit round 1: another caller using a creator's salt gets a different address.
+    function test_SaltIsBoundToCreator() public {
+        bytes32 salt = _nextSalt();
+        address squatter = makeAddr("squatter");
+        ERC721AuctionFactory.CreateParams memory p = _params();
+        p.creator = squatter;
+        vm.prank(squatter);
+        address theirs = factory.createInstance(salt, p);
+        assertEq(theirs, factory.computeInstanceAddress(salt, squatter));
+
+        vm.prank(artist);
+        address mine = factory.createInstance(salt, _params());
+        assertEq(mine, factory.computeInstanceAddress(salt, artist));
+        assertTrue(mine != theirs);
+    }
+
+    /// Claiming an escrowed token into a MiyaPool credits the winner, not the auction contract.
+    function test_EscrowClaimIntoPoolCreditsWinner() public {
+        ERC721AuctionInstance inst = _createDefaultInstance();
+        vm.prank(artist);
+        inst.queuePiece{value: 0.1 ether}("ipfs://piece1");
+        NonReceiverBidder bidder = new NonReceiverBidder();
+        vm.deal(address(bidder), 10 ether);
+        bidder.bid(address(inst), 1, 0.2 ether);
+        vm.warp(inst.getAuction(1).endTime);
+        inst.settleAuction(1);
+
+        MiyaPool pool = MiyaPool(new MiyaPoolFactory().createPool(address(inst), MiyaPool.RedeemMode.TARGETED));
+        bidder.claim(address(inst), 1, address(pool));
+        assertEq(pool.balanceOf(address(bidder)), 1e18);
+        assertEq(pool.balanceOf(address(inst)), 0);
+    }
+
     function test_SettleAuction_EOAWinnerMintedDirectly() public {
         ERC721AuctionInstance inst = _createDefaultInstance();
         vm.prank(artist);
@@ -713,4 +777,17 @@ contract NonReceiverBidder {
     }
 
     receive() external payable {}
+}
+
+contract GasBurningBidder {
+    receive() external payable {}
+
+    function bid(address inst, uint24 tokenId, uint256 amount) external {
+        ERC721AuctionInstance(payable(inst)).createBid{value: amount}(tokenId, "");
+    }
+
+    function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
+        while (true) {}
+        return this.onERC721Received.selector;
+    }
 }

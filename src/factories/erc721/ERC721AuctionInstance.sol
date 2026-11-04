@@ -13,6 +13,7 @@ import {IInstanceLifecycle, TYPE_ERC721, STATE_ACTIVE} from "../../interfaces/II
 
 // ── ERC721AuctionInstance errors ──────────────────────────────────────────────
 error InvalidAddress();
+error SettlementGasTooLow();
 error InvalidName();
 error InvalidSymbol();
 error InvalidLines();
@@ -46,6 +47,9 @@ error RenounceDisabled();
  *      All auction parameters are immutable after creation for predictability.
  */
 contract ERC721AuctionInstance is ERC721, Ownable, ReentrancyGuard, IInstanceLifecycle {
+    uint256 private constant WINNER_MINT_GAS = 500_000;
+    uint256 private constant SETTLE_RESERVE_GAS = 400_000;
+
     // ┌─────────────────────────┐
     // │         Types           │
     // └─────────────────────────┘
@@ -306,7 +310,10 @@ contract ERC721AuctionInstance is ERC721, Ownable, ReentrancyGuard, IInstanceLif
         // winner pulls it to any address with claimEscrowedToken().
         // Reentrancy is safe: auction.settled = true is set above and nonReentrant guards this function.
         address winner = auction.highBidder;
-        try this.safeMintWinner(winner, tokenId) {}
+        // Capped so a winner's hook can't burn the gas the rest of settlement needs. The check stops a settler sending
+        // too little gas to force the token into escrow.
+        if (gasleft() < WINNER_MINT_GAS + WINNER_MINT_GAS / 32 + SETTLE_RESERVE_GAS) revert SettlementGasTooLow();
+        try this.safeMintWinner{ gas: WINNER_MINT_GAS }(winner, tokenId) {}
         catch {
             _mint(address(this), tokenId);
             escrowedWinner[tokenId] = winner;
@@ -322,13 +329,16 @@ contract ERC721AuctionInstance is ERC721, Ownable, ReentrancyGuard, IInstanceLif
             SafeTransferLib.safeTransferETH(protocolTreasury, s.protocolCut);
         }
 
-        try vault.receiveContribution{value: s.vaultCut}(
+        // Parked cuts go with this one, so small ones add up past the vault's minimum.
+        uint256 cut = s.vaultCut + pendingVaultCut;
+        pendingVaultCut = 0;
+        try vault.receiveContribution{value: cut}(
             Currency.wrap(address(0)),
-            s.vaultCut,
+            cut,
             address(this)
         ) {} catch {
-            pendingVaultCut += s.vaultCut;
-            emit VaultContributionFailed(address(vault), s.vaultCut);
+            pendingVaultCut = cut;
+            emit VaultContributionFailed(address(vault), cut);
         }
         SmartTransferLib.smartTransferETH(owner(), s.remainder, weth);
 
@@ -352,7 +362,8 @@ contract ERC721AuctionInstance is ERC721, Ownable, ReentrancyGuard, IInstanceLif
     function claimEscrowedToken(uint24 tokenId, address to) external nonReentrant {
         if (escrowedWinner[tokenId] != msg.sender) revert NotEscrowedWinner();
         delete escrowedWinner[tokenId];
-        _safeTransfer(address(this), to, tokenId, "");
+        // The data names the winner, so a MiyaPool receiving this credits them rather than this contract.
+        _safeTransfer(address(this), to, tokenId, abi.encode(msg.sender));
         emit EscrowedTokenClaimed(tokenId, msg.sender, to);
     }
 

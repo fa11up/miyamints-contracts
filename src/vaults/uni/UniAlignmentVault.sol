@@ -388,9 +388,16 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
             alignmentToken, lastTickLower, lastTickUpper, poolManager,
             bytes32(PoolId.unwrap(v4PoolKey.toId()))
         );
-        uint256 ethToSwap = (ethToAdd * proportionToSwap) / 1e18; // round down: excess stays as ethForLP
+        // An LP add can't use every wei: the amounts rarely match the pool's ratio exactly, and fees earned by the
+        // position net off what it pays in. So work from everything the vault holds beyond what it owes, which feeds
+        // any leftover from the last conversion into this one and keeps leftovers from building up.
+        uint256 owed = callerReward + accumulatedFees - totalFeesClaimed + accumulatedProtocolFees;
+        uint256 ethAvailable = address(this).balance - owed;
+        // Fee tokens were converted above, so every token held is left over.
+        uint256 tokensHeld = SafeTransferLib.balanceOf(alignmentToken, address(this)) - pendingFeeTokens;
+        uint256 ethToSwap = _ethToSwap(ethAvailable, tokensHeld, proportionToSwap);
 
-        SwapLPResult memory r = _doSwapAndLP(ethToAdd, ethToSwap, minOutTarget, tickLower, tickUpper);
+        SwapLPResult memory r = _doSwapAndLP(owed, ethToSwap, minOutTarget, tickLower, tickUpper);
 
         address[] memory activeBenefactors = _getActiveBenefactors();
         _distributeSharesAndCleanup(ethPending, ethToAdd, r.liquidityUnitsAdded, activeBenefactors);
@@ -398,6 +405,22 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
         lpPositionValue = ethToSwap + r.targetTokenReceived;
         _payCallerReward(callerReward);
         emit LiquidityAdded(ethToSwap, r.targetTokenReceived, lpPositionValue, r.liquidityUnitsAdded, callerReward);
+    }
+
+    /// @dev How much ETH to swap so the two sides end up in the right proportion, counting tokens already held.
+    function _ethToSwap(uint256 ethAvailable, uint256 tokensHeld, uint256 proportionToSwap)
+        private
+        view
+        returns (uint256)
+    {
+        uint256 target = (ethAvailable * proportionToSwap) / 1e18; // round down: excess stays as ethForLP
+        if (tokensHeld == 0) return target;
+        (uint160 sqrtPriceX96, , ,) = StateLibrary.getSlot0(IPoolManager(poolManager), v4PoolKey.toId());
+        uint256 tokenValue = FixedPointMathLib.fullMulDiv(
+            FixedPointMathLib.fullMulDiv(tokensHeld, 1 << 96, sqrtPriceX96), 1 << 96, sqrtPriceX96
+        );
+        uint256 alreadyHeld = (tokenValue * (1e18 - proportionToSwap)) / 1e18;
+        return target > alreadyHeld ? target - alreadyHeld : 0;
     }
 
     /// @dev Caller reward for converting a pending batch of `ethPending` wei
@@ -408,21 +431,27 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
 
     // slither-disable-next-line arbitrary-send-eth,reentrancy-benign,unused-return
     function _doSwapAndLP(
-        uint256 ethToAdd,
+        uint256 owed,
         uint256 ethToSwap,
         uint256 minOutTarget,
         int24 tickLower,
         int24 tickUpper
     ) private returns (SwapLPResult memory r) {
-        (, r.targetTokenReceived) = IzRouterV4(zRouter).swapV4{value: ethToSwap}(
-            address(this), false, zRouterFee, zRouterTickSpacing,
-            address(0), alignmentToken, ethToSwap, minOutTarget, type(uint256).max
-        );
+        if (ethToSwap != 0) {
+            // zRouter refunds its whole ETH balance to the payer at the end of the swap, so ETH can arrive here.
+            _setCollecting(true);
+            (, r.targetTokenReceived) = IzRouterV4(zRouter).swapV4{value: ethToSwap}(
+                address(this), false, zRouterFee, zRouterTickSpacing,
+                address(0), alignmentToken, ethToSwap, minOutTarget, type(uint256).max
+            );
+            _setCollecting(false);
+        }
 
-        uint256 ethRemaining = ethToAdd - ethToSwap;
+        uint256 ethRemaining = address(this).balance - owed;
+        uint256 tokensForLP = SafeTransferLib.balanceOf(alignmentToken, address(this)) - pendingFeeTokens;
         (uint256 amount0, uint256 amount1) = Currency.unwrap(v4PoolKey.currency0) == alignmentToken
-            ? (r.targetTokenReceived, ethRemaining)
-            : (ethRemaining, r.targetTokenReceived);
+            ? (tokensForLP, ethRemaining)
+            : (ethRemaining, tokensForLP);
 
         r.liquidityUnitsAdded = uint256(_addToLpPosition(amount0, amount1, tickLower, tickUpper));
         totalLPUnits += r.liquidityUnitsAdded;

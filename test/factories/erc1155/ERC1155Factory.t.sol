@@ -158,7 +158,7 @@ contract ERC1155FactoryTest is Test {
 
     function test_computeInstanceAddress() public {
         bytes32 salt = _nextSalt();
-        address predicted = factory.computeInstanceAddress(salt);
+        address predicted = factory.computeInstanceAddress(salt, creator);
 
         vm.deal(creator, 1 ether);
         vm.prank(creator);
@@ -444,6 +444,26 @@ contract ERC1155FactoryTest is Test {
         );
 
         vm.stopPrank();
+    }
+
+    /// Audit round 1: anyone can split proceeds, so the cuts never wait on the artist. The artist still gets their share.
+    function test_Withdraw_AnyoneCanSplit() public {
+        vm.deal(minter1, 10 ether);
+        vm.startPrank(creator);
+        address instance = factory.createInstance{value: 0}(
+            _nextSalt(), _params("Anyone", creator, address(vault))
+        );
+        ERC1155Instance inst = ERC1155Instance(payable(instance));
+        inst.addEdition("P", 1 ether, 0, "ipfs://p", ERC1155Instance.PricingModel.UNLIMITED, 0, 0);
+        vm.stopPrank();
+        vm.prank(minter1);
+        inst.mint{value: 1 ether}(1, 1, bytes32(0), "", 1 ether);
+
+        uint256 before = creator.balance;
+        vm.prank(makeAddr("stranger"));
+        inst.withdraw(1 ether);
+        assertEq(inst.totalWithdrawn(), 1 ether);
+        assertGt(creator.balance, before);
     }
 
     function test_Withdraw_Tax() public {

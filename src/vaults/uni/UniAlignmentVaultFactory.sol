@@ -64,7 +64,7 @@ contract UniAlignmentVaultFactory is Ownable {
         address alignmentToken,
         uint256 alignmentTargetId,
         IVaultPriceValidator priceValidator
-    ) external returns (address vault) {
+    ) external onlyOwner returns (address vault) {
         bytes memory proxyCreationCode = abi.encodePacked(
             hex"3d602d80600a3d3981f3363d3d373d3d3d363d73",
             vaultImplementation,

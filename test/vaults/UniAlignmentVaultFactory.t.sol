@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import { Ownable } from "solady/auth/Ownable.sol";
 import "forge-std/Test.sol";
 import "../../src/vaults/uni/UniAlignmentVaultFactory.sol";
 import {UniAlignmentVault} from "../../src/vaults/uni/UniAlignmentVault.sol";
@@ -63,6 +64,13 @@ contract UniAlignmentVaultFactoryTest is Test {
             IMiyaRegistry(address(registry))
         );
         registry.setVaultFactory(address(factory), true);
+    }
+
+    function test_deployVault_ownerOnly() public {
+        bytes32 salt = _nextSalt();
+        vm.prank(makeAddr("stranger"));
+        vm.expectRevert(Ownable.Unauthorized.selector);
+        factory.deployVault(salt, address(alignmentToken), TARGET_ID, IVaultPriceValidator(address(0)));
     }
 
     function test_deployVault_setsAlignmentToken() public {

@@ -84,7 +84,7 @@ contract ERC1155Factory is Ownable, ReentrancyGuard, IFactory {
         // Forward fee directly to treasury — factory holds no ETH
         if (msg.value > 0) SafeTransferLib.safeTransferETH(treasury, msg.value);
 
-        instance = ICreateX(CREATEX).deployCreate3(salt, _buildInitCode(params, treasury, protocolFeeBps));
+        instance = ICreateX(CREATEX).deployCreate3(_creatorSalt(salt, msg.sender), _buildInitCode(params, treasury, protocolFeeBps));
         ERC1155Instance(payable(instance)).initializeFreeMint(params.freeMint.allocation, params.freeMint.scope);
         registry.registerInstance(instance, params.vault, params.creator);
 
@@ -154,9 +154,15 @@ contract ERC1155Factory is Ownable, ReentrancyGuard, IFactory {
 
     // ── Utilities ────────────────────────────────────────────────────────────
 
-    /// @notice Preview the deterministic address for a given salt.
-    function computeInstanceAddress(bytes32 salt) external view returns (address) {
-        bytes32 guardedSalt = keccak256(abi.encodePacked(uint256(uint160(address(this))), salt));
+    /// @notice Preview the deterministic address for a salt and creator.
+    function computeInstanceAddress(bytes32 salt, address creator) external view returns (address) {
+        bytes32 guardedSalt = keccak256(abi.encodePacked(uint256(uint160(address(this))), _creatorSalt(salt, creator)));
         return ICreateX(CREATEX).computeCreate3Address(guardedSalt, CREATEX);
+    }
+
+    /// @dev Binds the address to the creator and to this factory (CreateX guards salts prefixed with the caller), so
+    ///      nobody else can take the address a creator computed.
+    function _creatorSalt(bytes32 salt, address creator) private view returns (bytes32) {
+        return bytes32(abi.encodePacked(address(this), bytes1(0x00), bytes11(keccak256(abi.encode(creator, salt)))));
     }
 }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import { FixedPointMathLib } from "solady/utils/FixedPointMathLib.sol";
 import {IVaultPriceValidator} from "../interfaces/IVaultPriceValidator.sol";
 import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
@@ -57,15 +58,11 @@ contract UniswapVaultPriceValidator is IVaultPriceValidator {
     using StateLibrary for IPoolManager;
 
     error PriceDeviationTooHigh();
-    error InsufficientWETHLiquidity();
-    error SwapAmountTooLarge();
-    error InvalidDenominator();
-    error InsufficientPurchasePower();
-    error SwapProportionDeviationTooHigh();
 
     address public immutable weth;
     /// @notice WETH a V2 pair must hold before its price is used as a reference (same floor as the V2-only route).
-    uint256 public constant MIN_V2_REFERENCE_WETH = 10 ether;
+    uint256 private constant Q96 = 1 << 96;
+    uint256 public constant MIN_REFERENCE_WETH = 10 ether;
 
     address public immutable v2Factory;
     address public immutable v3Factory;
@@ -115,74 +112,22 @@ contract UniswapVaultPriceValidator is IVaultPriceValidator {
         return 0;
     }
 
-    function validatePrice(address token, uint256 pendingETH) external view override {
-        // Query V2 pool for price and reserves
-        (bool hasV2Pool, uint256 priceV2, uint112 reserveWETH, uint112 reserveToken) = _getV2PriceAndReserves(token);
-
-        // Query V3 pool for price and liquidity
+    /// @dev The vault only ever swaps through its own v4 pool, so other pools can only serve as price references.
+    function validatePrice(address token, uint256) external view override {
+        (bool hasV2Pool, uint256 priceV2, uint112 reserveWETH, ) = _getV2PriceAndReserves(token);
         (bool hasV3Pool, uint256 priceV3, ) = _getV3PriceAndLiquidity(token);
-
-        // Query V4 pool for price and liquidity (may be WETH or native ETH pool)
-        (bool hasV4Pool, uint256 priceV4, ) = _getV4PriceAndLiquidity(token);
-
-        // If no pools are available, skip validation (expected in unit tests with mock addresses)
-        if (!hasV2Pool && !hasV3Pool && !hasV4Pool) {
-            return;
-        }
 
         // A V2 pair only counts as a price reference once it holds real liquidity. Anyone can create a dust pair for
         // any token for almost nothing; trusting its price would let them block every conversion for that token.
-        bool v2IsReference = hasV2Pool && reserveWETH >= MIN_V2_REFERENCE_WETH;
-
-        // Cross-check prices across all available pools for arbitrage/manipulation detection
-        if (v2IsReference && hasV3Pool) {
+        if (hasV2Pool && reserveWETH >= MIN_REFERENCE_WETH && hasV3Pool) {
             (bool isAcceptable, ) = _checkPriceDeviation(priceV2, priceV3);
             if (!isAcceptable) revert PriceDeviationTooHigh();
-        }
-
-        // When V4 is the sole price source, cross-check its spot price against a V3 TWAP.
-        // V4 slot0 is manipulable within a block; the TWAP guard prevents flash-loan attacks
-        // on vault ETH. If no TWAP is available (new pool), skip validation — same behavior
-        // as before, but mature pools with V3 history are now protected.
-        if (hasV4Pool && !v2IsReference && !hasV3Pool && priceV4 != 0) {
-            uint160 twapSqrtPrice = _getTwapSqrtPriceX96(token);
-            if (twapSqrtPrice != 0) {
-                // Convert TWAP sqrtPriceX96 to the same price scale used by priceV4
-                uint256 sqrtScaled = uint256(twapSqrtPrice) >> 48;
-                uint256 rawTwap = (sqrtScaled * sqrtScaled * 1e18) >> 96;
-                // Determine token ordering to get WETH/token price
-                address currency0Addr = address(0) < token ? address(0) : token;
-                uint256 priceV4Twap = (currency0Addr == weth || currency0Addr == address(0))
-                    ? (rawTwap == 0 ? 0 : (1e18 * 1e18) / rawTwap)
-                    : rawTwap;
-                if (priceV4Twap != 0) {
-                    (bool isAcceptable, ) = _checkPriceDeviation(priceV4, priceV4Twap);
-                    if (!isAcceptable) revert PriceDeviationTooHigh();
-                }
-            }
-        }
-
-        // Verify sufficient liquidity for the pending swap
-        // Only enforce V2 capacity when V2 is the sole swap route (V3/V4 unavailable)
-        if (hasV2Pool && !hasV3Pool && !hasV4Pool) {
-            if (reserveWETH < 10 ether) revert InsufficientWETHLiquidity();
-
-            if (pendingETH > 0) {
-                uint256 maxSwapAmount = uint256(reserveWETH) / 10; // 10% of WETH reserve
-                if (pendingETH > maxSwapAmount) revert SwapAmountTooLarge();
-
-                uint256 amountInWithFee = pendingETH * 997;
-                uint256 denominator = (uint256(reserveWETH) * 1000) + amountInWithFee;
-                if (denominator == 0) revert InvalidDenominator();
-                uint256 expectedOut = (amountInWithFee * uint256(reserveToken)) / denominator;
-                if (expectedOut == 0) revert InsufficientPurchasePower();
-            }
         }
     }
 
     // slither-disable-next-line unused-return
     function calculateSwapProportion(
-        address token,
+        address, /* token */
         int24 tickLower,
         int24 tickUpper,
         address _poolManager,
@@ -205,99 +150,58 @@ contract UniswapVaultPriceValidator is IVaultPriceValidator {
             return 5e17;
         }
 
-        // Compute proportion from V4 spot price
-        (bool spotValid, uint256 spotProportion) = _computeProportionFromSqrtPrice(sqrtPriceX96, token, tickLower, tickUpper);
+        (bool spotValid, uint256 spotProportion) = _computeProportionFromSqrtPrice(sqrtPriceX96, tickLower, tickUpper);
         if (!spotValid) {
             return 5e17;
         }
 
-        // Cross-check V4 spot proportion against V3 TWAP proportion.
-        // V4 slot0 is a manipulable spot price; the TWAP guard prevents sandwich attacks
-        // on vault ETH during convertAndAddLiquidity.
-        uint160 twapSqrtPrice = _getTwapSqrtPriceX96(token);
-        if (twapSqrtPrice != 0) {
-            (bool twapValid, uint256 twapProportion) = _computeProportionFromSqrtPrice(twapSqrtPrice, token, tickLower, tickUpper);
-            if (twapValid) {
-                uint256 diff = spotProportion > twapProportion
-                    ? spotProportion - twapProportion
-                    : twapProportion - spotProportion;
-                // Reject if V4 spot proportion deviates more than 5% (5e16) from V3 TWAP proportion.
-                // A 5% shift in proportion corresponds to a significant price manipulation.
-                if (diff > 5e16) revert SwapProportionDeviationTooHigh();
-            }
-        } else {
-            // No V3 TWAP available (new pool or insufficient observation history).
-            // Clamp to a safety band [35%, 65%] to limit sandwich attack profit
-            // without bricking the vault. Full-range positions at unmanipulated prices
-            // are naturally in this range.
-            if (spotProportion < 35e16) spotProportion = 35e16;
-            if (spotProportion > 65e16) spotProportion = 65e16;
-        }
+        // A full-range position holds equal value on both sides, so this is about 50%. The band limits what a moved
+        // spot price can do to the split. No other pool can veto a conversion: floors are the keeper's job.
+        if (spotProportion < 35e16) spotProportion = 35e16;
+        if (spotProportion > 65e16) spotProportion = 65e16;
 
         return spotProportion;
     }
 
-    /// @dev Computes swap proportion from a given sqrtPriceX96 for the LP tick range.
-    ///      Returns (false, 0) when the price is outside the tick range (both amounts zero).
-    function _computeProportionFromSqrtPrice(
-        uint160 sqrtPriceX96,
-        address token,
-        int24 tickLower,
-        int24 tickUpper
-    ) private pure returns (bool valid, uint256 proportion) {
-        uint160 sqrtPriceAX96 = TickMath.getSqrtPriceAtTick(tickLower);
-        uint160 sqrtPriceBX96 = TickMath.getSqrtPriceAtTick(tickUpper);
-
-        (uint256 amount0, uint256 amount1) = LiquidityAmounts.getAmountsForLiquidity(
+    /// @dev The share of a batch to swap into the token: the token side's share of the position's value at this price.
+    ///      Returns (false, 0) when the position would hold nothing at this price.
+    ///      The token amount is converted to ETH value first: the two amounts are in different units.
+    function _computeProportionFromSqrtPrice(uint160 sqrtPriceX96, int24 tickLower, int24 tickUpper)
+        private
+        pure
+        returns (bool valid, uint256 proportion)
+    {
+        (uint256 ethAmount, uint256 tokenAmount) = LiquidityAmounts.getAmountsForLiquidity(
             sqrtPriceX96,
-            sqrtPriceAX96,
-            sqrtPriceBX96,
+            TickMath.getSqrtPriceAtTick(tickLower),
+            TickMath.getSqrtPriceAtTick(tickUpper),
             1e18
         );
-
-        uint256 total = amount0 + amount1;
-        if (total == 0) {
-            return (false, 0);
-        }
-
-        // currency0 is native ETH when address(0) < token (Uniswap V4 currency ordering)
-        bool currency0IsNativeETH = address(0) < token;
-        uint256 ethAmount = currency0IsNativeETH ? amount0 : amount1;
-
-        proportion = (ethAmount * 1e18) / total;
-        if (proportion > 1e18) proportion = 1e18;
-        return (true, proportion);
+        uint256 tokenValue = FixedPointMathLib.fullMulDiv(
+            FixedPointMathLib.fullMulDiv(tokenAmount, Q96, sqrtPriceX96), Q96, sqrtPriceX96
+        );
+        uint256 total = ethAmount + tokenValue;
+        if (total == 0) return (false, 0);
+        return (true, (tokenValue * 1e18) / total);
     }
 
-    /// @dev Queries V3 pools (across standard fee tiers) for a TWAP-derived sqrtPriceX96.
-    ///      Returns 0 if no V3 pool has sufficient observation history.
-    function _getTwapSqrtPriceX96(address token) private view returns (uint160) {
-        if (v3Factory.code.length == 0) return 0;
+    /// @dev Raw price scaled by 1e18. Cannot overflow: sqrtScaled fits 112 bits, and fullMulDiv handles the rest.
+    function _rawPrice(uint160 sqrtPriceX96) private pure returns (uint256) {
+        uint256 sqrtScaled = uint256(sqrtPriceX96) >> 48;
+        return FixedPointMathLib.fullMulDiv(sqrtScaled * sqrtScaled, 1e18, 1 << 96);
+    }
 
-        uint24[3] memory feeTiers = [uint24(3000), uint24(500), uint24(10000)];
-        uint32[] memory secondsAgos = new uint32[](2);
-        secondsAgos[0] = twapSecondsAgo;
-        secondsAgos[1] = 0;
-
-        for (uint256 i = 0; i < feeTiers.length; i++) {
-            address pool = IUniswapV3Factory(v3Factory).getPool(weth, token, feeTiers[i]);
-            if (pool == address(0)) continue;
-
-            try IUniswapV3Pool(pool).liquidity() returns (uint128 liq) {
-                if (liq == 0) continue;
-            } catch {
-                continue;
-            }
-
-            try IUniswapV3Pool(pool).observe(secondsAgos) returns (int56[] memory tickCumulatives, uint160[] memory) {
-                int56 delta = tickCumulatives[1] - tickCumulatives[0];
-                int24 meanTick = int24(delta / int56(uint56(twapSecondsAgo)));
-                if (delta < 0 && (delta % int56(uint56(twapSecondsAgo)) != 0)) meanTick--;
-                return TickMath.getSqrtPriceAtTick(meanTick);
-            } catch {}
-        }
-
-        return 0;
+    /// @dev A pool only counts as a price reference with real ETH depth at its current price. Anyone can create a pool
+    ///      with 1 wei of liquidity at any price; trusting it would let them block every conversion for that token.
+    function _hasReferenceDepth(uint160 sqrtPriceX96, uint128 liquidity, bool ethIsCurrency0)
+        private
+        pure
+        returns (bool)
+    {
+        uint256 virtualEth = ethIsCurrency0
+            ? FixedPointMathLib.fullMulDiv(liquidity, Q96, sqrtPriceX96)
+            : FixedPointMathLib.fullMulDiv(liquidity, sqrtPriceX96, Q96);
+        return virtualEth >= MIN_REFERENCE_WETH;
     }
 
     // --- private helpers (moved verbatim from vault) ---
@@ -367,8 +271,9 @@ contract UniswapVaultPriceValidator is IVaultPriceValidator {
 
         // Verify pool is not locked (reentrancy guard) and has liquidity via slot0/liquidity.
         // We read liquidity for the depth check but derive price from the TWAP, not slot0.
+        uint160 spotSqrtPriceX96;
         try IUniswapV3Pool(pool).slot0() returns (
-            uint160,
+            uint160 sqrtPriceX96,
             int24,
             uint16,
             uint16,
@@ -379,6 +284,7 @@ contract UniswapVaultPriceValidator is IVaultPriceValidator {
             if (!unlocked) {
                 return (false, 0, 0);
             }
+            spotSqrtPriceX96 = sqrtPriceX96;
         } catch {
             return (false, 0, 0);
         }
@@ -389,6 +295,11 @@ contract UniswapVaultPriceValidator is IVaultPriceValidator {
             }
             poolLiquidity = liq;
         } catch {
+            return (false, 0, 0);
+        }
+
+        address token0 = IUniswapV3Pool(pool).token0();
+        if (!_hasReferenceDepth(spotSqrtPriceX96, poolLiquidity, token0 == weth)) {
             return (false, 0, 0);
         }
 
@@ -409,11 +320,8 @@ contract UniswapVaultPriceValidator is IVaultPriceValidator {
             // Round toward negative infinity when remainder is negative (standard V3 TWAP rounding)
             if (delta < 0 && (delta % int56(uint56(twapSecondsAgo)) != 0)) meanTick--;
 
-            uint160 sqrtPriceX96 = TickMath.getSqrtPriceAtTick(meanTick);
-            uint256 sqrtScaled = uint256(sqrtPriceX96) >> 48;
-            uint256 rawPrice = (sqrtScaled * sqrtScaled * 1e18) >> 96;
+            uint256 rawPrice = _rawPrice(TickMath.getSqrtPriceAtTick(meanTick));
 
-            address token0 = IUniswapV3Pool(pool).token0();
             if (token0 == weth) {
                 if (rawPrice == 0) return (false, 0, 0);
                 price = (1e18 * 1e18) / rawPrice;
@@ -449,107 +357,6 @@ contract UniswapVaultPriceValidator is IVaultPriceValidator {
         }
 
         return (false, 0, 0);
-    }
-
-    function _getV4PriceAndLiquidity(address token)
-        private
-        view
-        returns (
-            bool hasV4Pool,
-            uint256 priceV4,
-            uint128 liquidity
-        )
-    {
-        if (poolManager.code.length == 0) {
-            return (false, 0, 0);
-        }
-
-        uint24[3] memory feeTiers = [uint24(3000), uint24(500), uint24(10000)];
-        int24[3] memory tickSpacings = [int24(60), int24(10), int24(200)];
-
-        for (uint256 i = 0; i < feeTiers.length; i++) {
-            (bool success, uint256 price, uint128 liq) = _queryV4PoolForTokenPair(
-                weth,
-                token,
-                feeTiers[i],
-                tickSpacings[i]
-            );
-
-            if (success) {
-                return (true, price, liq);
-            }
-
-            (success, price, liq) = _queryV4PoolForTokenPair(
-                address(0),
-                token,
-                feeTiers[i],
-                tickSpacings[i]
-            );
-
-            if (success) {
-                return (true, price, liq);
-            }
-        }
-
-        return (false, 0, 0);
-    }
-
-    // slither-disable-next-line unused-return
-    function _queryV4PoolForTokenPair(
-        address token0Addr,
-        address token1Addr,
-        uint24 fee,
-        int24 tickSpacing
-    )
-        private
-        view
-        returns (
-            bool success,
-            uint256 price,
-            uint128 poolLiquidity
-        )
-    {
-        (Currency currency0, Currency currency1) = token0Addr < token1Addr
-            ? (Currency.wrap(token0Addr), Currency.wrap(token1Addr))
-            : (Currency.wrap(token1Addr), Currency.wrap(token0Addr));
-
-        PoolKey memory poolKey = PoolKey({
-            currency0: currency0,
-            currency1: currency1,
-            fee: fee,
-            tickSpacing: tickSpacing,
-            hooks: IHooks(address(0))
-        });
-
-        PoolId poolId = poolKey.toId();
-
-        (uint160 sqrtPriceX96, , ,) = StateLibrary.getSlot0(IPoolManager(poolManager), poolId);
-
-        if (sqrtPriceX96 == 0) {
-            return (false, 0, 0);
-        }
-
-        uint128 liq = StateLibrary.getLiquidity(IPoolManager(poolManager), poolId);
-
-        if (liq == 0) {
-            return (false, 0, 0);
-        }
-
-        uint256 sqrtScaled = uint256(sqrtPriceX96) >> 48;
-        uint256 rawPrice = (sqrtScaled * sqrtScaled * 1e18) >> 96;
-
-        address currency0Addr = Currency.unwrap(currency0);
-
-        if (currency0Addr == weth || currency0Addr == address(0)) {
-            if (rawPrice == 0) {
-                return (false, 0, 0);
-            }
-            price = (1e18 * 1e18) / rawPrice;
-        } else {
-            price = rawPrice;
-        }
-
-        return (true, price, liq);
     }
 
     function _checkPriceDeviation(uint256 price1, uint256 price2)

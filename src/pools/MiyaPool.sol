@@ -70,6 +70,9 @@ contract MiyaPool is ERC20, ReentrancyGuard {
     uint256 internal constant HISTORY_WINDOW = 8191;
     /// @notice Most ids one commit can draw, so a reveal always fits in a block.
     uint256 public constant MAX_COMMIT_UNITS = 50;
+    /// @notice Gas each reveal transfer may use: above a standard transfer's cost, and low enough that the largest
+    ///         commit fits in one transaction under mainnet's gas cap even if every transfer burns all of it.
+    uint256 public constant REVEAL_TRANSFER_GAS = 200_000;
 
     address public immutable factory;
     address public immutable collection;
@@ -117,6 +120,8 @@ contract MiyaPool is ERC20, ReentrancyGuard {
     error CommitTooLarge();
     error InvalidRecipient();
     error NotEscrowed();
+    error AlreadyHeld(uint256 id);
+    error RevealGasTooLow();
     error TransferNotReceived(uint256 id);
 
     constructor(address _collection, Kind _kind, RedeemMode _mode) {
@@ -147,7 +152,7 @@ contract MiyaPool is ERC20, ReentrancyGuard {
     function heldIds(uint256 start, uint256 count) external view returns (uint256[] memory ids) {
         uint256 len = _ids.length();
         if (start >= len) return ids;
-        if (start + count > len) count = len - start;
+        if (count > len - start) count = len - start;
         ids = new uint256[](count);
         for (uint256 i; i < count; ++i) ids[i] = _ids.at(start + i);
     }
@@ -182,7 +187,7 @@ contract MiyaPool is ERC20, ReentrancyGuard {
     function onERC721Received(address, address from, uint256 id, bytes calldata data) external returns (bytes4) {
         if (msg.sender != collection || kind != Kind.ERC721) revert NotCollection();
         if (IERC721Pool(collection).ownerOf(id) != address(this)) revert TransferNotReceived(id);
-        _ids.add(id);
+        if (!_ids.add(id)) revert AlreadyHeld(id);
         if (mode == RedeemMode.RANDOM) _queue[_queueTail++] = id;
         address to = _recipient(from, data);
         _mint(to, UNIT);
@@ -229,6 +234,7 @@ contract MiyaPool is ERC20, ReentrancyGuard {
 
     /// @notice Burn UNIT tokens per unit and withdraw the chosen ids to `to`.
     function redeem(uint256[] calldata ids, uint256[] calldata amounts, address to) external nonReentrant {
+        if (to == address(this)) revert InvalidRecipient();
         if (mode != RedeemMode.TARGETED) revert WrongMode();
         if (ids.length == 0) revert EmptyRequest();
         if (kind == Kind.ERC721) {
@@ -270,7 +276,7 @@ contract MiyaPool is ERC20, ReentrancyGuard {
         if (mode != RedeemMode.RANDOM) revert WrongMode();
         if (amount == 0) revert EmptyRequest();
         if (amount > MAX_COMMIT_UNITS) revert CommitTooLarge();
-        if (to == address(0)) revert InvalidRecipient();
+        if (to == address(0) || to == address(this)) revert InvalidRecipient();
         uint256 held = _ids.length();
         if (held < pendingUnits + amount) revert InsufficientHeld();
         _burn(msg.sender, UNIT * amount);
@@ -312,7 +318,10 @@ contract MiyaPool is ERC20, ReentrancyGuard {
         }
         _queueHead = head;
         for (uint256 i; i < picked.length; ++i) {
-            try IERC721Pool(collection).transferFrom(address(this), c.recipient, picked[i]) {}
+            // Capped so a recipient the collection calls can't burn the gas the rest of the reveal needs. The check
+            // stops a revealer sending too little gas to force an id into escrow.
+            if (gasleft() < REVEAL_TRANSFER_GAS + REVEAL_TRANSFER_GAS / 32) revert RevealGasTooLow();
+            try IERC721Pool(collection).transferFrom{ gas: REVEAL_TRANSFER_GAS }(address(this), c.recipient, picked[i]) {}
             catch {
                 escrowedTo[picked[i]] = c.recipient;
                 emit RedeemEscrowed(commitId, c.recipient, picked[i]);
@@ -324,6 +333,7 @@ contract MiyaPool is ERC20, ReentrancyGuard {
     /// @notice Take an id the collection refused to send to the caller at reveal, to any address.
     function claimEscrowed(uint256 id, address to) external nonReentrant {
         if (escrowedTo[id] != msg.sender) revert NotEscrowed();
+        if (to == address(this)) revert InvalidRecipient();
         delete escrowedTo[id];
         IERC721Pool(collection).transferFrom(address(this), to, id);
         emit EscrowClaimed(msg.sender, to, id);
@@ -349,9 +359,11 @@ contract MiyaPool is ERC20, ReentrancyGuard {
         emit Deposited(from, to, ids, amounts);
     }
 
-    function _recipient(address from, bytes calldata data) internal pure returns (address to) {
+    function _recipient(address from, bytes calldata data) internal view returns (address to) {
         if (data.length == 32) to = abi.decode(data, (address));
         if (to == address(0)) to = from;
+        // address(0): a safe mint straight into the pool. address(this): a transfer from the pool to itself.
+        if (to == address(0) || to == address(this)) revert InvalidRecipient();
     }
 
     function _blockHash(uint256 n) internal view returns (bytes32 h) {

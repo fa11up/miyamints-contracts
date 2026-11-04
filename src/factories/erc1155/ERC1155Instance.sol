@@ -465,7 +465,6 @@ contract ERC1155Instance is Ownable, ReentrancyGuard, IInstanceLifecycle {
      * @param amount Amount to withdraw
      */
     function withdraw(uint256 amount) external nonReentrant {
-        if (msg.sender != owner()) revert Unauthorized();
         if (amount == 0) revert AmountMustBePositive();
         // Use proceeds accounting to prevent force-fed ETH from bypassing the split
         if (amount > totalProceeds - totalWithdrawn) revert InsufficientBalance();
@@ -481,13 +480,16 @@ contract ERC1155Instance is Ownable, ReentrancyGuard, IInstanceLifecycle {
         // Vault cut — tracks this instance as benefactor
         // If the vault reverts (e.g. broken upgrade), accumulate for retry rather than
         // blocking creator proceeds permanently.
+        // Parked cuts go with this one, so small ones add up past the vault's minimum.
+        uint256 cut = s.vaultCut + pendingVaultCut;
         uint256 vaultCutSent;
-        if (s.vaultCut > 0) {
-            try vault.receiveContribution{value: s.vaultCut}(Currency.wrap(address(0)), s.vaultCut, address(this)) {
-                vaultCutSent = s.vaultCut;
+        if (cut > 0) {
+            pendingVaultCut = 0;
+            try vault.receiveContribution{value: cut}(Currency.wrap(address(0)), cut, address(this)) {
+                vaultCutSent = cut;
             } catch {
-                pendingVaultCut += s.vaultCut;
-                emit VaultContributionFailed(address(vault), s.vaultCut);
+                pendingVaultCut = cut;
+                emit VaultContributionFailed(address(vault), cut);
             }
         }
 
