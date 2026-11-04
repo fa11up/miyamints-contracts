@@ -14,7 +14,7 @@ evm_version = "cancun"
 test = "test"
 script = "script"
 broadcast = "broadcast"
-fs_permissions = [{ access = "read-write", path = "./deployments/" }, { access = "read", path = "./script/config/" }]
+fs_permissions = [{ access = "read", path = "./script/config/" }]
 remappings = [
     "forge-std/=lib/forge-std/src/",
     "solady/=lib/solady/src/",
@@ -22,6 +22,10 @@ remappings = [
     "v4-core/test/=lib/v4-core/test/",
     "createx-forge/=lib/createx-forge/",
 ]
+
+# The deploy script writes deployments/<chainId>.json: `FOUNDRY_PROFILE=deploy forge script ...`
+[profile.deploy]
+fs_permissions = [{ access = "read-write", path = "./deployments/" }, { access = "read", path = "./script/config/" }]
 
 # Fast local iteration: `FOUNDRY_PROFILE=lite forge test`
 [profile.lite]

@@ -77,19 +77,19 @@ produced identical addresses). Re-running with the same deployer and namespace r
 3. **Dry run** (no `--broadcast`):
    ```sh
    cd contracts
-   OWNER=0xSafe KEEPER=0xKeeper forge script script/DeployMiyamints.s.sol \
+   FOUNDRY_PROFILE=deploy OWNER=0xSafe KEEPER=0xKeeper forge script script/DeployMiyamints.s.sol \
      --fork-url https://ethereum-rpc.publicnode.com --account miyamints-deployer --sender 0xDeployer
    ```
    Check the printed addresses, owner and treasury. Robinhood: add `TREASURY=0x...` and use
    `--fork-url https://rpc.mainnet.chain.robinhood.com`.
 4. **Broadcast + verify, Ethereum:**
    ```sh
-   OWNER=0xSafe KEEPER=0xKeeper forge script script/DeployMiyamints.s.sol --rpc-url https://ethereum-rpc.publicnode.com \
+   FOUNDRY_PROFILE=deploy OWNER=0xSafe KEEPER=0xKeeper forge script script/DeployMiyamints.s.sol --rpc-url https://ethereum-rpc.publicnode.com \
      --account miyamints-deployer --sender 0xDeployer --broadcast --verify --etherscan-api-key $ETHERSCAN_API_KEY
    ```
    (`--ledger --sender 0x...` instead of `--account` for a hardware wallet.) Robinhood Chain (Blockscout):
    ```sh
-   OWNER=0xSafe KEEPER=0xKeeper TREASURY=0x... forge script script/DeployMiyamints.s.sol \
+   FOUNDRY_PROFILE=deploy OWNER=0xSafe KEEPER=0xKeeper TREASURY=0x... forge script script/DeployMiyamints.s.sol \
      --rpc-url https://rpc.mainnet.chain.robinhood.com --account miyamints-deployer --sender 0xDeployer --broadcast \
      --verify --verifier blockscout --verifier-url https://robinhoodchain.blockscout.com/api/
    ```
