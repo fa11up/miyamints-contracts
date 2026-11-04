@@ -11,6 +11,7 @@ import {IGatingModule, GatingScope} from "../../gating/IGatingModule.sol";
 
 // ── Free mint errors ─────────────────────────────────────────────────────────
 error FreeMintDisabled();
+error NoPendingProtocolCut();
 error FreeMintAlreadyClaimed();
 error FreeMintExhausted();
 
@@ -131,8 +132,11 @@ contract ERC1155Instance is Ownable, ReentrancyGuard, IInstanceLifecycle {
     ///      Failed vault contributions stay in the contract, tracked here so they
     ///      cannot be re-withdrawn as artist proceeds.
     uint256 public pendingVaultCut;
+    /// @notice Protocol cuts the treasury refused, held here until it accepts them.
+    uint256 public pendingProtocolCut;
 
     // Events
+    event ProtocolCutParked(uint256 amount);
     event TransferSingle(
         address indexed operator,
         address indexed from,
@@ -473,9 +477,7 @@ contract ERC1155Instance is Ownable, ReentrancyGuard, IInstanceLifecycle {
         RevenueSplitLib.Split memory s = RevenueSplitLib.split(amount, protocolFeeBps, alignmentBps);
 
         // Protocol cut to treasury
-        if (s.protocolCut > 0 && protocolTreasury != address(0)) {
-            SafeTransferLib.safeTransferETH(protocolTreasury, s.protocolCut);
-        }
+        if (protocolTreasury != address(0)) _payProtocol(s.protocolCut);
 
         // Vault cut — tracks this instance as benefactor
         // If the vault reverts (e.g. broken upgrade), accumulate for retry rather than
@@ -497,6 +499,33 @@ contract ERC1155Instance is Ownable, ReentrancyGuard, IInstanceLifecycle {
         SmartTransferLib.smartTransferETH(owner(), s.remainder, weth);
 
         emit Withdrawn(owner(), s.remainder, vaultCutSent, s.protocolCut);
+    }
+
+    /// @dev Pay the treasury this cut and anything parked. A treasury that refuses is never a reason to hold up a sale.
+    function _payProtocol(uint256 amount) private {
+        uint256 total = amount + pendingProtocolCut;
+        if (total == 0) return;
+        pendingProtocolCut = 0;
+        if (!SafeTransferLib.trySafeTransferETH(protocolTreasury, total, SafeTransferLib.GAS_STIPEND_NO_GRIEF)) {
+            pendingProtocolCut = total;
+            emit ProtocolCutParked(total);
+        }
+    }
+
+    /// @notice Retry paying protocol cuts the treasury previously refused. Anyone can call this.
+    function flushPendingProtocolCut() external nonReentrant {
+        uint256 pending = pendingProtocolCut;
+        if (pending == 0) revert NoPendingProtocolCut();
+        pendingProtocolCut = 0;
+        SafeTransferLib.safeTransferETH(protocolTreasury, pending);
+    }
+
+    /// @notice Count ETH that reached this contract outside a mint as proceeds, so withdraw() can split it.
+    function sweepUntrackedETH() external nonReentrant {
+        uint256 untracked =
+            address(this).balance - (totalProceeds - totalWithdrawn) - pendingVaultCut - pendingProtocolCut;
+        if (untracked == 0) revert AmountMustBePositive();
+        totalProceeds += untracked;
     }
 
     /**
@@ -537,8 +566,8 @@ contract ERC1155Instance is Ownable, ReentrancyGuard, IInstanceLifecycle {
     }
 
     /// @notice Accept ETH from the vault when it pays out claimed fees (UniAlignmentVault.claimFees pays the
-    ///         benefactor with a plain call). Such ETH is never counted in totalProceeds or pendingVaultCut,
-    ///         so withdraw() cannot route it through the revenue split; claimVaultFees() forwards it to the owner.
+    ///         benefactor with a plain call); claimVaultFees() forwards it to the owner. ETH from anywhere else
+    ///         stays out of the split until sweepUntrackedETH() counts it.
     receive() external payable {}
 
     // ┌─────────────────────────┐

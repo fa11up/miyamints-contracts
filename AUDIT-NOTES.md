@@ -99,7 +99,7 @@ Fixed, with regression tests. The vault findings were reproduced on a mainnet fo
   for a full-range position at any price, still clamped to 35-65%.
 - **zRouter refund blocked conversions** (High): zRouter refunds its whole ETH balance to the payer after an ETH swap, so
   1 wei sent to the router made `receive()` revert every conversion. The swap now runs in collecting mode.
-- **Leftovers** (Low): an LP add can't use every wei, and fees earned by the position net off what it pays in. Each
+- **Leftovers** (Low): an LP add can't use every wei. Each
   conversion works from all the ETH and tokens the vault holds beyond what it owes, so leftovers feed the next batch,
   which gets them as a small windfall in LP shares (those can only earn yield). ETH sent to the vault outside
   contributions ends up here too.
@@ -124,8 +124,8 @@ Accepted or deferred:
 
 - **RANDOM pools on Robinhood Chain (4663) are not safe to offer.** The chain runs on Arbitrum's stack: `block.number` is
   an estimate of the Ethereum block, `blockhash` is documented as "cryptographically insecure" and not to be relied on
-  for randomness, and the EIP-2935 lookup always fails there, so the window is 256 blocks. Mainnet is unaffected. RANDOM
-  needs a different source of randomness, or must stay off, before any 4663 deployment.
+  for randomness, and the EIP-2935 lookup always fails there, so the window is 256 blocks. Mainnet is unaffected. `MiyaPoolFactory` refuses
+  RANDOM on 4663; TARGETED pools still open there. It needs a different source of randomness before that can change.
 - **Gating module**: it gates nothing even if configured: the no-password tier is open, and the "password" is a public
   hash. `FREE_MINT_ONLY` and `claimFreeMint` bugs are latent behind it. It stays off at deploy and needs a redesign
   before it is enabled.
@@ -173,7 +173,15 @@ Fixed:
 - **Keeper trust (M2).** The keeper must simulate each conversion: swap size depends on the pool's state, and `minOutTarget`
   is the tokens bought across all passes. The keeper's floors are the only price protection. A malicious keeper, or whoever holds its
   key, can sandwich its own conversion with low floors and take up to the whole batch being converted. It can also stop
-  converting (ETH and fee tokens wait; the owner can replace it). It cannot touch earlier LP positions or settled fees.
+  converting (ETH and fee tokens wait; the owner can replace it). It can also sandwich `convertFeeTokens` (or `minEthOutForFees`) with a 1-wei floor and take the pending fee tokens,
+  which are yield holders already earned. It cannot touch earlier LP positions or settled ETH fees.
+- **`minOutTarget` only catches an upward price move.** If someone sells the token into the pool just before the keeper's
+  quote, the quote already reflects the low price, the floor passes, and the vault adds liquidity at that price. The
+  attacker's buy-back realises the position's impermanent loss. Thin pools and predictable conversions make this worse:
+  seed deep, convert through a private mempool, and check the price against an outside reference before converting.
+- **`validatePrice` compares v2 spot against a v3 TWAP.** Someone who pays arbitrage to keep a v2 pair more than 5% off during
+  the keeper's blocks can delay conversions for as long as they fund it. Delay only: no funds move. It needs a token with
+  both a deep v2 pair and a deep v3 pool, which INFER doesn't have.
 - **`validatePrice` is a backstop, not a guarantee.** It cross-checks v2 against v3 only when both have real depth. INFER
   has no v2 or v3 pool at all, so it checks nothing there. Safety rests on the keeper's floors.
 - **Default alignment token is INFER**, which needs a hookless ETH pool seeded before deployment (DEPLOY.md).
@@ -235,3 +243,24 @@ dispute / panel / council / claim / refund / sweep sequences, and a replay of a 
   interest. New stakes are then refused, but existing positions are not re-covered automatically.
 - **The eligibility gate is live.** Unlike every other dependency, the gate is not snapshotted per market, so a
   compromised signer can be rotated. It can only refuse new stakes.
+
+## Final sweep (b7193ce), fixed without another external round
+
+Job 6dfbf85f. No high findings. Four of the five seats could not run code in their sandbox, so most of this was found by
+reading; only the economics seat ran tests. Not exercised by that round: extraction numbers against a real pool, worst-case
+gas for the multi-pass loop, real zRouter on a fork, on-chain config addresses.
+
+- **RANDOM on Robinhood Chain** (Medium): `MiyaPoolFactory` now refuses it on 4663.
+- **A conversion's own swap fees** (Low): the vault books them after each swap, so they go to holders before the batch closes
+  and the protocol gets its cut. On a first conversion there are no holders, so they stay in the batch.
+- **Refusing treasury** (Low): all three sale types park the cut in `pendingProtocolCut`, pay it with the next cut, and
+  anyone can call `flushPendingProtocolCut`. A sale no longer depends on the treasury.
+- **Vault salts** (Low): `deployVault` and `computeVaultAddress` refuse a salt not bound to the factory.
+- **Validator precision** (Low, reported but not reachable): the example needs a v2 reserve above uint112's limit. The cross-check needs 10
+  WETH in the pair, so the price can't go below about 2e-15 ETH, where rounding is about 5 bps against a 500 bps limit. No
+  change; tests pin that lowest price.
+- **Stray ETH on ERC1155** (Low): `sweepUntrackedETH` counts it as proceeds, so `withdraw` splits it.
+- **Vault implementation** (Info): the factory spends its initialization at construction.
+- **Batch cost rounding** (Info): a small base price no longer rounds to free.
+- **Fork test** (Info): `REQUIRE_FORK_TESTS=true` fails instead of skipping. CI and pre-deploy runs should set it. It still seeds
+  its own 100 ETH pool until the real one exists.

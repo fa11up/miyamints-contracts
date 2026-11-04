@@ -5,7 +5,7 @@ import {Test, console} from "forge-std/Test.sol";
 import {MiyaPool} from "../../../src/pools/MiyaPool.sol";
 import {MiyaPoolFactory} from "../../../src/pools/MiyaPoolFactory.sol";
 import {ERC721AuctionFactory} from "../../../src/factories/erc721/ERC721AuctionFactory.sol";
-import {ERC721AuctionInstance, SettlementGasTooLow, DepositRequired, URIRequired, BidBelowMinimum, BidTooLow, AuctionExpired, AuctionNotEnded, NoBids, HasBids, NotEscrowedWinner, RenounceDisabled} from "../../../src/factories/erc721/ERC721AuctionInstance.sol";
+import {ERC721AuctionInstance, NoPendingProtocolCut, SettlementGasTooLow, DepositRequired, URIRequired, BidBelowMinimum, BidTooLow, AuctionExpired, AuctionNotEnded, NoBids, HasBids, NotEscrowedWinner, RenounceDisabled} from "../../../src/factories/erc721/ERC721AuctionInstance.sol";
 import {UniAlignmentVault} from "../../../src/vaults/uni/UniAlignmentVault.sol";
 import {MockEXECToken} from "../../mocks/MockEXECToken.sol";
 import {MockZRouter} from "../../mocks/MockZRouter.sol";
@@ -763,6 +763,61 @@ contract ERC721AuctionFactoryTest is Test {
         vm.prank(artist);
         vm.expectRevert(RenounceDisabled.selector);
         inst.renounceOwnership();
+    }
+
+    // ── a treasury that refuses ETH ──────────────────────────────────────────
+
+    function _instanceWithOwnTreasury(address taker) internal returns (ERC721AuctionInstance) {
+        vm.prank(owner);
+        registry.setTreasury(taker);
+        return _createDefaultInstance();
+    }
+
+    function test_SettleAuction_ParksProtocolCutWhenTreasuryRefuses() public {
+        address taker = makeAddr("refusing treasury");
+        ERC721AuctionInstance inst = _instanceWithOwnTreasury(taker);
+        vm.prank(artist);
+        inst.queuePiece{value: 0.1 ether}("ipfs://piece1");
+        vm.deal(bidder1, 1 ether);
+        vm.prank(bidder1);
+        inst.createBid{value: 1 ether}(1, "");
+        vm.warp(inst.getAuction(1).endTime);
+
+        vm.etch(taker, hex"60006000fd");
+        inst.settleAuction(1);
+
+        assertTrue(inst.getAuction(1).settled);
+        assertEq(inst.ownerOf(1), bidder1);
+        assertEq(inst.pendingProtocolCut(), 0.01 ether);
+
+        vm.expectRevert();
+        inst.flushPendingProtocolCut();
+
+        vm.etch(taker, "");
+        inst.flushPendingProtocolCut();
+        assertEq(taker.balance, 0.01 ether);
+        assertEq(inst.pendingProtocolCut(), 0);
+    }
+
+    function test_ReclaimUnsold_ParksDepositWhenTreasuryRefuses() public {
+        address taker = makeAddr("refusing treasury");
+        ERC721AuctionInstance inst = _instanceWithOwnTreasury(taker);
+        vm.prank(artist);
+        inst.queuePiece{value: 0.1 ether}("ipfs://piece1");
+        vm.warp(inst.getAuction(1).endTime);
+
+        vm.etch(taker, hex"60006000fd");
+        vm.prank(artist);
+        inst.reclaimUnsold(1);
+
+        assertTrue(inst.getAuction(1).settled);
+        assertEq(inst.pendingProtocolCut(), 0.1 ether);
+    }
+
+    function test_FlushProtocolCut_NothingParked() public {
+        ERC721AuctionInstance inst = _createDefaultInstance();
+        vm.expectRevert(NoPendingProtocolCut.selector);
+        inst.flushPendingProtocolCut();
     }
 }
 

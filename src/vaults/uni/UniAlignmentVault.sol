@@ -226,6 +226,12 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
 
     // ========== Initialize (clone pattern) ==========
 
+    /// @notice Spends this contract's one initialization, so the implementation behind the clones can't be claimed.
+    function disableInitializer() external {
+        if (_initialized) revert AlreadyInitialized();
+        _initialized = true;
+    }
+
     /// @notice Initialize the vault clone with all required dependencies
     /// @dev Called once by the factory after EIP-1167 cloning. Sets owner to msg.sender (factory).
     /// @param _weth WETH contract address
@@ -451,10 +457,9 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
         int24 tickLower,
         int24 tickUpper
     ) private returns (SwapLPResult memory r) {
-        uint256 owed = callerReward + accumulatedFees - totalFeesClaimed + accumulatedProtocolFees;
         bool swapped;
         for (uint256 pass; pass < MAX_LP_PASSES; ++pass) {
-            uint256 ethAvailable = address(this).balance - owed;
+            uint256 ethAvailable = address(this).balance - _ethOwed(callerReward);
             // Fee tokens not converted are spoken for; every other token held is free to add.
             uint256 tokensHeld = SafeTransferLib.balanceOf(alignmentToken, address(this)) - pendingFeeTokens;
             uint256 ethToSwap = _ethToSwap(ethAvailable, tokensHeld, proportionToSwap);
@@ -471,9 +476,12 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
                 _setCollecting(false);
                 r.targetTokenReceived += bought;
                 swapped = true;
+                // That swap paid the vault's own position a fee, which belongs to the holders who earned it. The add
+                // below would net it off silently. On a first conversion there is no position to collect from yet.
+                _collectAndAccumulateVaultFees(true);
             }
 
-            uint256 ethForLP = address(this).balance - owed;
+            uint256 ethForLP = address(this).balance - _ethOwed(callerReward);
             uint256 tokensForLP = SafeTransferLib.balanceOf(alignmentToken, address(this)) - pendingFeeTokens;
             (uint256 amount0, uint256 amount1) = Currency.unwrap(v4PoolKey.currency0) == alignmentToken
                 ? (tokensForLP, ethForLP)
@@ -482,6 +490,11 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
         }
         if (swapped && r.targetTokenReceived < minOutTarget) revert InsufficientOutput();
         totalLPUnits += r.liquidityUnitsAdded;
+    }
+
+    /// @dev ETH held that is spoken for and can't go into a position. Grows as yield is booked mid-conversion.
+    function _ethOwed(uint256 callerReward) private view returns (uint256) {
+        return callerReward + accumulatedFees - totalFeesClaimed + accumulatedProtocolFees;
     }
 
     /// @dev Costs the same however many contributed. Runs after this batch's fees and yield are booked, so new

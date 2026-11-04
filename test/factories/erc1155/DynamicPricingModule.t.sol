@@ -97,4 +97,18 @@ contract DynamicPricingModuleTest is Test {
         emit IComponentModule.MetadataURIUpdated("ipfs://Qm123");
         module.setMetadataURI("ipfs://Qm123");
     }
+
+    /// The old order of operations truncated this to 0, so a small base price minted for free.
+    function test_calculateBatchCost_smallBasePriceStillCharges() public view {
+        assertEq(module.calculateBatchCost(1000, 100, 0, 1), 1000);
+        assertEq(module.calculateBatchCost(100, 1, 0, 1), 100);
+    }
+
+    function testFuzz_calculateBatchCost_singleMintMatchesPrice(uint256 base, uint16 rate, uint16 minted) public view {
+        base = bound(base, 1, 1000 ether);
+        rate = uint16(bound(rate, 1, 1000));
+        minted = uint16(bound(minted, 0, 200));
+        uint256 price = module.calculatePrice(base, rate, minted);
+        assertApproxEqAbs(module.calculateBatchCost(base, rate, minted, 1), price, price / 1e12 + 1);
+    }
 }

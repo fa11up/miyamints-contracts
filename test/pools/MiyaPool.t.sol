@@ -68,6 +68,26 @@ contract MiyaPoolTest is Test {
         editions.mint(alice, 2, 3);
     }
 
+    // ── chains ───────────────────────────────────────────────────────────────
+
+    function test_randomPoolRefusedOnRobinhoodChain() public {
+        vm.chainId(4663);
+        vm.expectRevert(MiyaPoolFactory.RandomUnsafeOnThisChain.selector);
+        factory.createPool(address(nft), MiyaPool.RedeemMode.RANDOM);
+    }
+
+    function test_targetedPoolStillOpensOnRobinhoodChain() public {
+        vm.chainId(4663);
+        address pool = factory.createPool(address(nft), MiyaPool.RedeemMode.TARGETED);
+        assertEq(factory.poolOf(address(nft), MiyaPool.RedeemMode.TARGETED), pool);
+    }
+
+    function test_randomPoolStillOpensOnMainnet() public {
+        vm.chainId(1);
+        address pool = factory.createPool(address(nft), MiyaPool.RedeemMode.RANDOM);
+        assertEq(factory.poolOf(address(nft), MiyaPool.RedeemMode.RANDOM), pool);
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
 
     function _pool721(MiyaPool.RedeemMode mode) internal returns (MiyaPool pool) {

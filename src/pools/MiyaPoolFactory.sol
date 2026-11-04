@@ -13,6 +13,8 @@ contract MiyaPoolFactory {
     bytes4 internal constant ERC721_ID = 0x80ac58cd;
     bytes4 internal constant ERC1155_ID = 0xd9b67a26;
 
+    uint256 private constant ROBINHOOD_CHAIN_ID = 4663;
+
     mapping(address collection => mapping(MiyaPool.RedeemMode mode => address pool)) public poolOf;
     address[] public allPools;
 
@@ -23,11 +25,14 @@ contract MiyaPoolFactory {
     error PoolExists(address pool);
     error UnsupportedCollection();
     error RandomRequiresERC721();
+    error RandomUnsafeOnThisChain();
 
     function createPool(address collection, MiyaPool.RedeemMode mode) external returns (address pool) {
         if (poolOf[collection][mode] != address(0)) revert PoolExists(poolOf[collection][mode]);
         MiyaPool.Kind kind = _detectKind(collection);
         if (kind == MiyaPool.Kind.ERC1155 && mode == MiyaPool.RedeemMode.RANDOM) revert RandomRequiresERC721();
+        // Robinhood Chain's block hashes come from its sequencer, so a RANDOM draw there could be steered.
+        if (mode == MiyaPool.RedeemMode.RANDOM && block.chainid == ROBINHOOD_CHAIN_ID) revert RandomUnsafeOnThisChain();
         pool = address(new MiyaPool{ salt: _salt(collection, mode) }(collection, kind, mode));
         poolOf[collection][mode] = pool;
         allPools.push(pool);

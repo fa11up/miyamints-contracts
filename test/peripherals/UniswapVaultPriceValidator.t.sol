@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import { Test } from "forge-std/Test.sol";
+import { FixedPointMathLib } from "solady/utils/FixedPointMathLib.sol";
 import { TickMath } from "v4-core/libraries/TickMath.sol";
 import { UniswapVaultPriceValidator } from "../../src/peripherals/UniswapVaultPriceValidator.sol";
 
@@ -130,6 +131,28 @@ contract UniswapVaultPriceValidatorTest is Test {
 
     function test_dustV2PairCannotBlockConversions() public {
         v2.set(address(new MockV2Pair(TOKEN, WETH, 1e12, 1)));
+        validator.validatePrice(TOKEN, 1 ether);
+    }
+
+    /// The cheapest price a real v2 reference can have: uint112 caps the token reserve near 5e33, and it needs 10 WETH.
+    /// Integer rounding of the two prices is nowhere near the 5% limit there.
+    function test_cheapestV2ReferenceAgreeingPricesPass() public {
+        int24 tick = -338_000;
+        uint256 sqrt = TickMath.getSqrtPriceAtTick(tick);
+        uint256 wethReserve = FixedPointMathLib.fullMulDiv(FixedPointMathLib.fullMulDiv(5e33, sqrt, 1 << 96), sqrt, 1 << 96);
+        assertGe(wethReserve, validator.MIN_REFERENCE_WETH(), "reference must count");
+        v2.set(address(new MockV2Pair(TOKEN, WETH, 5e33, uint112(wethReserve))));
+        _v3At(1e30, tick, 100e18);
+        validator.validatePrice(TOKEN, 1 ether);
+    }
+
+    function test_cheapestV2ReferenceDisagreeingPricesBlock() public {
+        int24 tick = -338_000;
+        uint256 sqrt = TickMath.getSqrtPriceAtTick(tick);
+        uint256 wethReserve = FixedPointMathLib.fullMulDiv(FixedPointMathLib.fullMulDiv(5e33, sqrt, 1 << 96), sqrt, 1 << 96);
+        v2.set(address(new MockV2Pair(TOKEN, WETH, 5e33, uint112(wethReserve * 2))));
+        _v3At(1e30, tick, 100e18);
+        vm.expectRevert(UniswapVaultPriceValidator.PriceDeviationTooHigh.selector);
         validator.validatePrice(TOKEN, 1 ether);
     }
 

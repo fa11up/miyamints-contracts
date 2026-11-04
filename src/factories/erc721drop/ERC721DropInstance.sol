@@ -77,8 +77,11 @@ contract ERC721DropInstance is ERC721, ERC2981, Ownable, ReentrancyGuard {
     uint256 public totalSupply;
     uint256 public ownerMinted;
     uint256 public pendingVaultCut;
+    /// @notice Protocol cuts the treasury refused, held here until it accepts them.
+    uint256 public pendingProtocolCut;
 
     event PhasesSet(Phase[] phases);
+    event ProtocolCutParked(uint256 amount);
     event Minted(address indexed to, uint256 indexed phaseId, uint256 firstId, uint256 quantity, uint256 paid);
     event MetadataUpdated(string baseURI, string unrevealedURI, string contractURI);
     event MetadataLocked();
@@ -233,10 +236,10 @@ contract ERC721DropInstance is ERC721, ERC2981, Ownable, ReentrancyGuard {
 
     /// @notice Split the mint proceeds held here. Callable by anyone, so neither cut can be withheld.
     function withdraw() external nonReentrant {
-        uint256 amount = address(this).balance - pendingVaultCut;
+        uint256 amount = address(this).balance - pendingVaultCut - pendingProtocolCut;
         if (amount == 0) revert NothingToWithdraw();
         RevenueSplitLib.Split memory s = RevenueSplitLib.split(amount, protocolBps, alignmentBps);
-        if (s.protocolCut != 0) SafeTransferLib.safeTransferETH(treasury, s.protocolCut);
+        _payProtocol(s.protocolCut);
         // Parked cuts go with this one, so small ones add up past the vault's minimum.
         uint256 cut = s.vaultCut + pendingVaultCut;
         uint256 sentToVault;
@@ -251,6 +254,25 @@ contract ERC721DropInstance is ERC721, ERC2981, Ownable, ReentrancyGuard {
         }
         if (s.remainder != 0) SmartTransferLib.smartTransferETH(owner(), s.remainder, weth);
         emit Withdrawn(s.remainder, sentToVault, s.protocolCut);
+    }
+
+    /// @dev Pay the treasury this cut and anything parked. A treasury that refuses is never a reason to hold up a sale.
+    function _payProtocol(uint256 amount) private {
+        uint256 total = amount + pendingProtocolCut;
+        if (total == 0) return;
+        pendingProtocolCut = 0;
+        if (!SafeTransferLib.trySafeTransferETH(treasury, total, SafeTransferLib.GAS_STIPEND_NO_GRIEF)) {
+            pendingProtocolCut = total;
+            emit ProtocolCutParked(total);
+        }
+    }
+
+    /// @notice Retry paying protocol cuts the treasury previously refused. Anyone can call this.
+    function flushPendingProtocolCut() external nonReentrant {
+        uint256 pending = pendingProtocolCut;
+        if (pending == 0) revert NothingToWithdraw();
+        pendingProtocolCut = 0;
+        SafeTransferLib.safeTransferETH(treasury, pending);
     }
 
     /// @notice Retry delivering vault cuts the vault previously rejected.

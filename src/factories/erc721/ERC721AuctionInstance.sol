@@ -14,6 +14,7 @@ import {IInstanceLifecycle, TYPE_ERC721, STATE_ACTIVE} from "../../interfaces/II
 // ── ERC721AuctionInstance errors ──────────────────────────────────────────────
 error InvalidAddress();
 error SettlementGasTooLow();
+error NoPendingProtocolCut();
 error InvalidName();
 error InvalidSymbol();
 error InvalidLines();
@@ -104,6 +105,8 @@ contract ERC721AuctionInstance is ERC721, Ownable, ReentrancyGuard, IInstanceLif
 
     /// @dev Vault cuts that could not be sent (vault reverted). Retry via flushPendingVaultCut().
     uint256 public pendingVaultCut;
+    /// @notice Protocol cuts the treasury refused, held here until it accepts them.
+    uint256 public pendingProtocolCut;
 
     /// @notice Winner of a settled auction whose token is held here because the safe mint to them failed
     ///         (contract winner without a working onERC721Received). Claim with claimEscrowedToken().
@@ -113,6 +116,7 @@ contract ERC721AuctionInstance is ERC721, Ownable, ReentrancyGuard, IInstanceLif
     // │         Events          │
     // └─────────────────────────┘
 
+    event ProtocolCutParked(uint256 amount);
     event PieceQueued(uint24 indexed tokenId, uint8 indexed line, uint256 minBid, string tokenURI);
     event AuctionStarted(uint24 indexed tokenId, uint40 startTime, uint40 endTime);
     event BidPlaced(uint24 indexed tokenId, address indexed bidder, uint256 amount);
@@ -325,9 +329,7 @@ contract ERC721AuctionInstance is ERC721, Ownable, ReentrancyGuard, IInstanceLif
 
         RevenueSplitLib.Split memory s = RevenueSplitLib.split(auction.highBid, protocolFeeBps, alignmentBps);
 
-        if (s.protocolCut > 0 && protocolTreasury != address(0)) {
-            SafeTransferLib.safeTransferETH(protocolTreasury, s.protocolCut);
-        }
+        _payProtocol(s.protocolCut);
 
         // Parked cuts go with this one, so small ones add up past the vault's minimum.
         uint256 cut = s.vaultCut + pendingVaultCut;
@@ -390,7 +392,7 @@ contract ERC721AuctionInstance is ERC721, Ownable, ReentrancyGuard, IInstanceLif
 
         // Forfeit deposit to protocol treasury
         uint256 deposit = auction.minBid;
-        SafeTransferLib.safeTransferETH(protocolTreasury, deposit);
+        _payProtocol(deposit);
 
         emit UnsoldReclaimed(tokenId, deposit);
 
@@ -410,6 +412,25 @@ contract ERC721AuctionInstance is ERC721, Ownable, ReentrancyGuard, IInstanceLif
         totalClaimed = vault.claimFees();
         if (totalClaimed == 0) revert NoFeesToClaim();
         SmartTransferLib.smartTransferETH(owner(), totalClaimed, weth);
+    }
+
+    /// @dev Pay the treasury this cut and anything parked. A treasury that refuses is never a reason to hold up a sale.
+    function _payProtocol(uint256 amount) private {
+        uint256 total = amount + pendingProtocolCut;
+        if (total == 0) return;
+        pendingProtocolCut = 0;
+        if (!SafeTransferLib.trySafeTransferETH(protocolTreasury, total, SafeTransferLib.GAS_STIPEND_NO_GRIEF)) {
+            pendingProtocolCut = total;
+            emit ProtocolCutParked(total);
+        }
+    }
+
+    /// @notice Retry paying protocol cuts the treasury previously refused. Anyone can call this.
+    function flushPendingProtocolCut() external nonReentrant {
+        uint256 pending = pendingProtocolCut;
+        if (pending == 0) revert NoPendingProtocolCut();
+        pendingProtocolCut = 0;
+        SafeTransferLib.safeTransferETH(protocolTreasury, pending);
     }
 
     /// @notice Retry sending any previously failed vault cuts.

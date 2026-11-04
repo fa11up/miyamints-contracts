@@ -251,4 +251,43 @@ contract UniAlignmentVaultFactoryTest is Test {
         vm.expectRevert(UniAlignmentVault.PoolKeyAlreadySet.selector);
         UniAlignmentVault(payable(vault)).setV4PoolKey(other);
     }
+
+    function test_saltNotBoundToFactoryIsRefused() public {
+        bytes32 unbound = keccak256("vault-2");
+        vm.expectRevert(UniAlignmentVaultFactory.InvalidVaultSalt.selector);
+        factory.deployVault(unbound, address(alignmentToken), TARGET_ID, IVaultPriceValidator(address(0)));
+        vm.expectRevert(UniAlignmentVaultFactory.InvalidVaultSalt.selector);
+        factory.computeVaultAddress(unbound);
+    }
+
+    function test_saltWithChainFlagIsRefused() public {
+        bytes32 flagged = bytes32(abi.encodePacked(address(factory), uint8(0x01), bytes11(uint88(1))));
+        vm.expectRevert(UniAlignmentVaultFactory.InvalidVaultSalt.selector);
+        factory.computeVaultAddress(flagged);
+    }
+
+    function test_previewMatchesDeployment() public {
+        bytes32 salt = _nextSalt();
+        address preview = factory.computeVaultAddress(salt);
+        address vault = factory.deployVault(salt, address(alignmentToken), TARGET_ID, IVaultPriceValidator(address(0)));
+        assertEq(vault, preview);
+    }
+
+    function test_implementationCannotBeClaimed() public {
+        UniAlignmentVault impl = UniAlignmentVault(payable(factory.vaultImplementation()));
+        vm.prank(makeAddr("stranger"));
+        vm.expectRevert();
+        impl.initialize(
+            makeAddr("stranger"),
+            address(1),
+            address(2),
+            address(alignmentToken),
+            address(3),
+            3000,
+            60,
+            IVaultPriceValidator(address(0)),
+            IMiyaRegistry(address(registry)),
+            TARGET_ID
+        );
+    }
 }

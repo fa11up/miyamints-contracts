@@ -58,7 +58,9 @@ contract DynamicPricingModule is Ownable, IDynamicPricingModule {
         uint256 r = 1e18 + (priceIncreaseRate * 1e14);
         uint256 rStart = FixedPointMathLib.rpow(r, startMinted, 1e18);
         uint256 rAmount = FixedPointMathLib.rpow(r, amount, 1e18);
-        uint256 numerator = basePrice.mulWad(rStart).mulWad(rAmount - 1e18);
-        return numerator.divWad(r - 1e18);
+        // Divide first and last by the large terms, so a small basePrice doesn't truncate to nothing on the way.
+        return FixedPointMathLib.fullMulDiv(
+            FixedPointMathLib.fullMulDiv(basePrice, rStart, r - 1e18), rAmount - 1e18, 1e18
+        );
     }
 }

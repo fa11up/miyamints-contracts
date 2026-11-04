@@ -67,8 +67,11 @@ produced identical addresses). Re-running with the same deployer and namespace r
 
 ## Runbook
 
-**Robinhood Chain: don't offer RANDOM pools.** `blockhash` on Arbitrum-based chains is documented as insecure randomness
-(AUDIT-NOTES.md). They need a different randomness source, or must stay off, before any launch there.
+**Robinhood Chain: no RANDOM pools.** `blockhash` on Arbitrum-based chains is documented as insecure randomness
+(AUDIT-NOTES.md), so `MiyaPoolFactory` refuses them on 4663. Keep the app from offering them there.
+
+**Run the fork tests for real.** Set `REQUIRE_FORK_TESTS=true` before deploying, or a machine without an RPC skips them and
+reports green.
 
 **Seed the alignment pool in one transaction, then check it.** `PoolManager.initialize` is open to anyone, so an unseeded
 pool can be initialized first at any price. Initialize and add liquidity atomically (one call through a position manager

@@ -649,4 +649,68 @@ contract ERC721DropTest is Test {
         assertEq(treasury.balance + vault.received() + artist.balance, PRICE * quantity);
         assertEq(address(d).balance, 0);
     }
+
+    // ── a treasury that refuses ETH ──────────────────────────────────────────
+
+    function test_withdrawParksProtocolCutWhenTreasuryRefuses() public {
+        vm.etch(treasury, hex"60006000fd");
+        ERC721DropInstance d = _drop(100, 1500);
+        vm.warp(block.timestamp + 1 days);
+        vm.prank(carol);
+        d.mint{ value: PRICE * 20 }(1, 20, _noProof()); // 1 ether
+
+        d.withdraw();
+
+        assertEq(d.pendingProtocolCut(), 0.01 ether, "parked");
+        assertEq(vault.received(), 0.15 ether, "vault still paid");
+        assertEq(artist.balance, 0.84 ether, "artist still paid");
+        assertEq(address(d).balance, 0.01 ether, "only the parked cut stays");
+    }
+
+    function test_parkedProtocolCutIsNotSplitAgain() public {
+        vm.etch(treasury, hex"60006000fd");
+        ERC721DropInstance d = _drop(100, 1500);
+        vm.warp(block.timestamp + 1 days);
+        vm.prank(carol);
+        d.mint{ value: PRICE * 20 }(1, 20, _noProof());
+        d.withdraw();
+
+        vm.expectRevert(ERC721DropInstance.NothingToWithdraw.selector);
+        d.withdraw();
+    }
+
+    function test_parkedProtocolCutReachesTreasuryOnceItAccepts() public {
+        vm.etch(treasury, hex"60006000fd");
+        ERC721DropInstance d = _drop(100, 1500);
+        vm.warp(block.timestamp + 1 days);
+        vm.prank(carol);
+        d.mint{ value: PRICE * 20 }(1, 20, _noProof());
+        d.withdraw();
+
+        vm.expectRevert();
+        d.flushPendingProtocolCut();
+
+        vm.etch(treasury, "");
+        vm.prank(makeAddr("anyone"));
+        d.flushPendingProtocolCut();
+        assertEq(treasury.balance, 0.01 ether);
+        assertEq(d.pendingProtocolCut(), 0);
+        assertEq(address(d).balance, 0);
+    }
+
+    function test_nextWithdrawCarriesParkedProtocolCut() public {
+        vm.etch(treasury, hex"60006000fd");
+        ERC721DropInstance d = _drop(100, 1500);
+        vm.warp(block.timestamp + 1 days);
+        vm.prank(carol);
+        d.mint{ value: PRICE * 20 }(1, 20, _noProof());
+        d.withdraw();
+
+        vm.etch(treasury, "");
+        vm.prank(alice);
+        d.mint{ value: PRICE * 20 }(1, 20, _noProof());
+        d.withdraw();
+        assertEq(treasury.balance, 0.02 ether);
+        assertEq(d.pendingProtocolCut(), 0);
+    }
 }

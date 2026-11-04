@@ -29,6 +29,8 @@ contract UniAlignmentVaultFactory is Ownable {
 
     event VaultDeployed(address indexed vault, address indexed alignmentToken);
 
+    error InvalidVaultSalt();
+
     constructor(
         // slither-disable-next-line missing-zero-check
         address _weth,
@@ -49,7 +51,9 @@ contract UniAlignmentVaultFactory is Ownable {
         zRouterTickSpacing = _zRouterTickSpacing;
         defaultPriceValidator = _defaultPriceValidator;
         registry = _registry;
-        vaultImplementation = address(new UniAlignmentVault());
+        UniAlignmentVault implementation = new UniAlignmentVault();
+        implementation.disableInitializer();
+        vaultImplementation = address(implementation);
     }
 
     /// @notice Deploy a new vault clone via CREATE3
@@ -65,6 +69,7 @@ contract UniAlignmentVaultFactory is Ownable {
         uint256 alignmentTargetId,
         IVaultPriceValidator priceValidator
     ) external onlyOwner returns (address vault) {
+        _requireFactorySalt(salt);
         bytes memory proxyCreationCode = abi.encodePacked(
             hex"3d602d80600a3d3981f3363d3d373d3d3d363d73",
             vaultImplementation,
@@ -100,7 +105,14 @@ contract UniAlignmentVaultFactory is Ownable {
 
     /// @notice Preview the deterministic address for a given salt
     function computeVaultAddress(bytes32 salt) external view returns (address) {
+        _requireFactorySalt(salt);
         bytes32 guardedSalt = keccak256(abi.encodePacked(uint256(uint160(address(this))), salt));
         return ICreateX(CREATEX).computeCreate3Address(guardedSalt, CREATEX);
+    }
+
+    /// @dev CreateX only binds a salt to its sender when it starts with that sender and a 0x00 byte. Any other salt could
+    ///      be claimed by anyone first, and would land somewhere other than computeVaultAddress says.
+    function _requireFactorySalt(bytes32 salt) private view {
+        if (bytes20(salt) != bytes20(address(this)) || salt[20] != 0x00) revert InvalidVaultSalt();
     }
 }

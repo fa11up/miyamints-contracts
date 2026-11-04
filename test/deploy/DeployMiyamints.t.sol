@@ -98,6 +98,8 @@ contract DeployMiyamintsForkTest is Test {
         }
         if (!forked || block.chainid != 1) {
             forked = false;
+            // Without this, a machine with no RPC skips every test here and still reports green.
+            require(!vm.envOr("REQUIRE_FORK_TESTS", false), "fork tests required but no mainnet fork");
             return;
         }
 
