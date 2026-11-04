@@ -48,13 +48,14 @@ produced identical addresses). Re-running with the same deployer and namespace r
 | v2 factory (validator) | `0x5C69…aA6f` (pairs under 10 WETH ignored) | none on chain | `0xF62c…80E6` |
 | CreateX / Permit2 | canonical, verified | canonical, verified | canonical, verified |
 | treasury | imdUSD Treasury `0x6Ac8…7Bc` | **unset: `TREASURY` required** | deployer if unset |
-| default alignment token | CULT `0x0000…eCa4` | USDG `0x5fc5…1168` (placeholder) | test token |
+| default alignment token | INFER `0x53d0…7921` (seed its pool first) | USDG `0x5fc5…1168` (placeholder) | test token |
 
 ## Env
 
 | Var | Required | Meaning |
 |---|---|---|
 | `OWNER` | strongly recommended | Final owner (a Safe on that chain). Unset = the deployer keeps ownership and the script prints a loud warning. |
+| `KEEPER` | strongly recommended | The only address that can run vault swaps (`MiyaRegistry.conversionKeeper`). Unset = conversions stay paused until the owner calls `setConversionKeeper`. |
 | `TREASURY` | 4663: yes | Overrides config `treasury`. On 4663 the mainnet imdUSD Treasury address has no code. |
 | `ALIGNMENT_TOKEN`, `ALIGNMENT_TARGET_NAME` | no | Override the default vault's token / target name. Needs a hookless native-ETH v4 pool at the config fee tier with liquidity, else the script stops (`ALLOW_MISSING_POOL=true` to bypass). |
 | `PROTOCOL_FEE_BPS`, `MIN_ALIGNMENT_BPS` | no | Defaults 100 (1%, max 500) and 1000 (10%). |
@@ -76,19 +77,19 @@ produced identical addresses). Re-running with the same deployer and namespace r
 3. **Dry run** (no `--broadcast`):
    ```sh
    cd contracts
-   OWNER=0xSafe forge script script/DeployMiyamints.s.sol \
+   OWNER=0xSafe KEEPER=0xKeeper forge script script/DeployMiyamints.s.sol \
      --fork-url https://ethereum-rpc.publicnode.com --account miyamints-deployer --sender 0xDeployer
    ```
    Check the printed addresses, owner and treasury. Robinhood: add `TREASURY=0x...` and use
    `--fork-url https://rpc.mainnet.chain.robinhood.com`.
 4. **Broadcast + verify, Ethereum:**
    ```sh
-   OWNER=0xSafe forge script script/DeployMiyamints.s.sol --rpc-url https://ethereum-rpc.publicnode.com \
+   OWNER=0xSafe KEEPER=0xKeeper forge script script/DeployMiyamints.s.sol --rpc-url https://ethereum-rpc.publicnode.com \
      --account miyamints-deployer --sender 0xDeployer --broadcast --verify --etherscan-api-key $ETHERSCAN_API_KEY
    ```
    (`--ledger --sender 0x...` instead of `--account` for a hardware wallet.) Robinhood Chain (Blockscout):
    ```sh
-   OWNER=0xSafe TREASURY=0x... forge script script/DeployMiyamints.s.sol \
+   OWNER=0xSafe KEEPER=0xKeeper TREASURY=0x... forge script script/DeployMiyamints.s.sol \
      --rpc-url https://rpc.mainnet.chain.robinhood.com --account miyamints-deployer --sender 0xDeployer --broadcast \
      --verify --verifier blockscout --verifier-url https://robinhoodchain.blockscout.com/api/
    ```
@@ -116,13 +117,15 @@ produced identical addresses). Re-running with the same deployer and namespace r
 - **Deployer key**: a fresh keystore account or Ledger (`--account` / `--ledger`). Nothing is hardcoded.
 - **`OWNER` Safe per chain** (1 and 4663). The mainnet governance Safe has no code on 4663.
 - **`TREASURY` on 4663.** Mainnet uses the imdUSD Treasury `0x6Ac8fF96Fb8DCF5d79A8eF1E59D9AC23f2BD27Bc`.
-- **Default alignment token (mainnet): CULT** (Remilia's Milady Cult Coin, `0x0000000000c5dc95539589fbD24BE07c6C14eCa4`).
-  Why: the tests name the target "Remilia", the legacy app aligned to Milady (NFTX vault 392), and CULT is the only
-  ecosystem candidate with a hookless native-ETH v4 pool. INFER, the miyanet token, has no ETH v4 pool, so a vault for
-  it could not convert. Override with `ALIGNMENT_TOKEN` once INFER (or anything else) has one.
-- **Vault fee tier is factory-wide and immutable**: mainnet uses 1% / 200 because the CULT 0.3% pool has zero
-  liquidity. Every vault from this factory swaps and LPs at 1%. A different tier means a second vault factory.
-- **4663 default alignment token: USDG, a placeholder.** There is no CULT or INFER on 4663. Pick a real target before
+- **Default alignment token (mainnet): INFER** (`0x53d0eA0A685220718Dc6a0a6e4617194C6F37921`). INFER trades through
+  IMD and has no ETH pool, so **a hookless native-ETH v4 pool at 1% / tick spacing 200 must be seeded before deploying**;
+  the script stops at its pool check otherwise. Pool depth limits what each conversion can swap without heavy slippage.
+- **Keeper**: `KEEPER` runs `convertAndAddLiquidity` and `convertFeeTokens`, through a private mempool, with minimum
+  outputs from a live quote. A new pool has no reference price, so nothing on chain can check those floors. If the
+  keeper stops, vault ETH and fee tokens wait (nothing is lost) until the owner sets a new one.
+- **Vault fee tier is factory-wide and immutable**: every vault from this factory swaps and LPs at 1%. A different tier
+  means a second vault factory.
+- **4663 default alignment token: USDG, a placeholder.** There is no INFER on 4663. Pick a real target before
   broadcasting there (it needs an ETH v4 pool at 0.3%, or change `zRouterFee` in `config/4663.json`).
 - **Fees**: protocol 1% (`PROTOCOL_FEE_BPS`), minimum alignment 10% (`MIN_ALIGNMENT_BPS`), matching the plan.
 - **Gating module is off by default.** `PasswordTierGatingModule.configureFor` only accepts a first configuration
@@ -132,9 +135,7 @@ produced identical addresses). Re-running with the same deployer and namespace r
 ## Fixed: dust v2 pairs blocked vault conversion
 
 `UniswapVaultPriceValidator.validatePrice` used to revert `PriceDeviationTooHigh` whenever a token had both a v2 pair
-and a v3 pool whose prices disagreed. Mainnet CULT has a dust v2 pair (0.000004 WETH / 98 CULT), and anyone can make
+and a v3 pool whose prices disagreed. A token with a dust v2 pair hit this, and anyone can make
 one for any token for almost nothing, so this was a cheap way to block every vault's conversions. Since 2026-11-02 a
 v2 pair only counts as a price reference once it holds `MIN_V2_REFERENCE_WETH` (10 ETH, the same floor as the v2-only
-route). The mainnet config uses the real v2 factory again, and the fork test converts real ETH through the CULT v4 pool
-with the dust pair present. A dust v3 pool is the same class of problem and stays with the open M2 (sandwich/TWAP)
-finding in AUDIT-NOTES.md.
+route). The mainnet config uses the real v2 factory again. `validatePrice` is now a backstop only: see M2 in AUDIT-NOTES.md.

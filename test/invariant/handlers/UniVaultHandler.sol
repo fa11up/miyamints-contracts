@@ -70,7 +70,7 @@ contract UniVaultHandler is Test {
         }
         uint256 preTotalShares = vault.totalShares();
 
-        vault.convertAndAddLiquidity(1);
+        vault.convertAndAddLiquidity(1, 1);
         ghost_hasLP = true;
         ghost_conversions++;
 

@@ -504,8 +504,9 @@ contract ERC1155VaultFeeClaimTest is Test {
         inst.withdraw(1 ether);
 
         // contribution converts into benefactor shares for the instance, then the vault earns fees
+        registry.setConversionKeeper(keeper);
         vm.prank(keeper);
-        vault.convertAndAddLiquidity(1);
+        vault.convertAndAddLiquidity(1, 1);
         assertGt(vault.benefactorShares(address(inst)), 0);
         vault.depositFees{value: 3 ether}();
     }

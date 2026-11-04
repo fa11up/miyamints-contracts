@@ -16,9 +16,9 @@
   "minAlignmentBps": 1000,
   "maxPriceDeviationBps": 500,
   "twapSeconds": 1800,
-  "alignmentTargetName": "Remilia (CULT)",
-  "alignmentToken": "0x0000000000c5dc95539589fbD24BE07c6C14eCa4",
+  "alignmentTargetName": "INFER",
+  "alignmentToken": "0x53d0eA0A685220718Dc6a0a6e4617194C6F37921",
   "deployMockAlignmentToken": false,
   "deployGatingModule": false,
-  "_verified": "2026-11-01, block ~26,324,849: every address above has code (cast code -r https://ethereum-rpc.publicnode.com). treasury = imdUSD Treasury (25 kB). zRouter = zammdefi zRouter (README address), exposes swapV4 0x21c0dad2. CULT/native-ETH hookless v4 pools: fee 10000/ts 200 initialized with liquidity 3.67e20; fee 3000/ts 60 initialized but liquidity 0, hence zRouterFee 10000 / tickSpacing 200 (factory-wide, applies to every vault this factory deploys). v2Factory = Uniswap v2 factory 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f (live). The WETH/CULT v2 pair 0x1bAA7c23ACA7a76e4D149b27ED9C451BC02eB886 is dust (0.000004 WETH vs 98 CULT); since 2026-11-02 the validator ignores v2 pairs under MIN_V2_REFERENCE_WETH (10 ETH), so dust pairs no longer block conversion."
+  "_verified": "2026-11-01, block ~26,324,849: every address above has code (cast code -r https://ethereum-rpc.publicnode.com). treasury = imdUSD Treasury (25 kB). zRouter = zammdefi zRouter (README address), exposes swapV4 0x21c0dad2. INFER has no hookless native-ETH v4 pool yet (2026-11-04): seed one at fee 10000/ts 200 before deploying, or the script stops at its pool check. zRouterFee 10000 / tickSpacing 200 is factory-wide and applies to every vault this factory deploys. v2Factory = Uniswap v2 factory 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f (live). Since 2026-11-02 the validator ignores v2 pairs under MIN_V2_REFERENCE_WETH (10 ETH), so dust pairs no longer block conversion."
 }

@@ -34,6 +34,7 @@ contract UniAlignmentVaultRealV4Test is Test {
     address alice = makeAddr("alice");
     address bob = makeAddr("bob");
     address treasury = address(0xFEE);
+    MiyaRegistry reg;
 
     function setUp() public {
         pm = new PoolManager(address(this));
@@ -50,10 +51,11 @@ contract UniAlignmentVaultRealV4Test is Test {
             key, IPoolManager.ModifyLiquidityParams(-887220, 887220, 50 ether, 0), ""
         );
 
-        MiyaRegistry reg = new MiyaRegistry(address(this), treasury, 100, 1000);
+        reg = new MiyaRegistry(address(this), treasury, 100, 1000);
         address[] memory toks = new address[](1);
         toks[0] = address(token);
         reg.addTarget("t", toks);
+        reg.setConversionKeeper(address(this));
         zr = new MockZRouter();
         token.transfer(address(zr), 1_000_000e18);
         vm.deal(address(zr), 100 ether); // liquidity for the token->ETH leg of fee collection
@@ -85,7 +87,7 @@ contract UniAlignmentVaultRealV4Test is Test {
 
     function test_claimFeesSucceedsWhenEthFeesAccrue() public {
         _contribute(alice, 2 ether);
-        vault.convertAndAddLiquidity(1);
+        vault.convertAndAddLiquidity(1, 1);
         assertGt(vault.totalLPUnits(), 0, "LP added via real PoolManager");
 
         _trade(3);
@@ -112,7 +114,7 @@ contract UniAlignmentVaultRealV4Test is Test {
 
     function test_claimFeesAsDelegateSucceedsWhenEthFeesAccrue() public {
         _contribute(alice, 2 ether);
-        vault.convertAndAddLiquidity(1);
+        vault.convertAndAddLiquidity(1, 1);
         vm.prank(alice);
         vault.delegateBenefactor(bob);
         _trade(3);
@@ -126,11 +128,11 @@ contract UniAlignmentVaultRealV4Test is Test {
     /// Fees accrued in the LP before a second conversion belong to the existing holders only.
     function test_secondConversionDoesNotDiluteAccruedLpFees() public {
         _contribute(alice, 2 ether);
-        vault.convertAndAddLiquidity(1);
+        vault.convertAndAddLiquidity(1, 1);
         _trade(3);
 
         _contribute(bob, 2 ether);
-        vault.convertAndAddLiquidity(1); // collects LP fees for alice before bob's shares exist
+        vault.convertAndAddLiquidity(1, 1); // collects LP fees for alice before bob's shares exist
 
         uint256 aliceOwed = vault.getUnclaimedFees(alice);
         assertGt(aliceOwed, 0);
@@ -139,5 +141,73 @@ contract UniAlignmentVaultRealV4Test is Test {
         vm.prank(alice);
         assertEq(vault.claimFees(), aliceOwed);
         assertGe(address(vault).balance, vault.accumulatedProtocolFees(), "solvent");
+    }
+
+    // ── M2: only the keeper swaps ───────────────────────────────────────────
+
+    function test_onlyKeeperConverts() public {
+        _contribute(alice, 2 ether);
+        vm.startPrank(alice);
+        vm.expectRevert(UniAlignmentVault.NotKeeper.selector);
+        vault.convertAndAddLiquidity(1, 1);
+        vm.expectRevert(UniAlignmentVault.NotKeeper.selector);
+        vault.convertFeeTokens(1);
+        vm.stopPrank();
+
+        reg.setConversionKeeper(address(0));
+        vm.expectRevert(UniAlignmentVault.NotKeeper.selector);
+        vault.convertAndAddLiquidity(1, 1);
+    }
+
+    function test_onlyOwnerSetsKeeper() public {
+        vm.prank(alice);
+        vm.expectRevert();
+        reg.setConversionKeeper(alice);
+    }
+
+    /// A claim is open to anyone: it must not swap, or it could be sandwiched with no price floor.
+    function test_claimLeavesFeeTokensForTheKeeper() public {
+        _contribute(alice, 2 ether);
+        vault.convertAndAddLiquidity(1, 1);
+        _trade(3);
+
+        vm.expectCall(address(zr), abi.encodeWithSelector(MockZRouter.swapV4.selector), 0);
+        vm.prank(alice);
+        vault.claimFees();
+
+        uint256 pending = vault.pendingFeeTokens();
+        assertGt(pending, 0, "token-side fees wait for the keeper");
+        assertGe(token.balanceOf(address(vault)), pending, "and are still held");
+    }
+
+    function test_keeperConvertsFeeTokensAndCreditsHolders() public {
+        _contribute(alice, 2 ether);
+        vault.convertAndAddLiquidity(1, 1);
+        _trade(3);
+
+        vm.expectRevert(UniAlignmentVault.AmountMustBePositive.selector);
+        vault.convertFeeTokens(0);
+
+        uint256 before = vault.getUnclaimedFees(alice);
+        vault.convertFeeTokens(1);
+        assertEq(vault.pendingFeeTokens(), 0);
+        assertGt(vault.getUnclaimedFees(alice), before, "converted fees reach the holder");
+    }
+
+    /// H2 must survive the deferred swap: fee tokens earned before a join stay with the earlier holders.
+    function test_pendingFeeTokensDoNotDiluteToNewShares() public {
+        _contribute(alice, 2 ether);
+        vault.convertAndAddLiquidity(1, 1);
+        _trade(3);
+        vm.prank(alice);
+        vault.claimFees();
+        assertGt(vault.pendingFeeTokens(), 0);
+
+        _contribute(bob, 2 ether);
+        vault.convertAndAddLiquidity(1, 1);
+        assertEq(vault.pendingFeeTokens(), 0, "converted before the join");
+        assertGt(vault.benefactorShares(bob), 0);
+        assertEq(vault.getUnclaimedFees(bob), 0, "bob earned nothing yet");
+        assertGt(vault.getUnclaimedFees(alice), 0, "alice keeps them");
     }
 }

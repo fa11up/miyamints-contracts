@@ -75,8 +75,9 @@ contract MiyaPoolHandler is Test {
 
     function revealRandom(uint256 pick, uint256 blocks) external {
         if (openCommits.length == 0) return;
-        uint256 i = pick % openCommits.length;
-        uint256 id = openCommits[i];
+        uint256 id = random.nextRevealId();
+        uint256 i;
+        while (openCommits[i] != id) ++i;
         (, uint64 target,,) = random.commits(id);
         vm.roll(block.number + bound(blocks, 0, 300));
         if (block.number <= target) vm.roll(target + 1);

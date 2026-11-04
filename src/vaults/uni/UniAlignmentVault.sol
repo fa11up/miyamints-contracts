@@ -81,6 +81,7 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
     error TooManyConversionParticipants();
     error PoolKeyAlreadySet();
     error HooksNotAllowed();
+    error NotKeeper();
 
     // ── Anti-DoS constants ────────────────────────────────────────────────
     uint256 public constant MIN_CONTRIBUTION = 0.001 ether;
@@ -187,11 +188,17 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
     uint256 public constant MAX_CONVERSION_REWARD_BPS = 100; // 1% of the batch
 
     uint24 public v3PreferredFee = 3000;
-    uint256 public maxPriceDeviationBps = 500;
+    /// @notice LP fees collected in the alignment token, waiting for a keeper conversion.
+    uint256 public pendingFeeTokens;
 
     // Position tracking
     int24 public lastTickLower;
     int24 public lastTickUpper;
+
+    modifier onlyKeeper() {
+        if (msg.sender != registry.conversionKeeper()) revert NotKeeper();
+        _;
+    }
 
     // ========== Events ==========
 
@@ -266,7 +273,6 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
         // Initialize defaults that can't use declaration initializers with clones
         protocolYieldCutBps = 100;
         v3PreferredFee = 3000;
-        maxPriceDeviationBps = 500;
         vaultFeeCollectionInterval = 1 days;
         dustDistributionThreshold = 1e18;
 
@@ -341,10 +347,12 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
 
     /**
      * @notice Convert accumulated pending ETH to alignment token and add liquidity to V4.
-     * @dev Public incentivized function - caller earns reward for execution.
+     * @dev Keeper only (registry.conversionKeeper). The pool may have no manipulation-resistant reference price, so
+     *      the floors come from the keeper, which submits through a private mempool. The caller earns the reward.
      *      Uses priceValidator for manipulation checks and proportion calculation.
      *      Uses swapRouter for the actual DEX swap.
      * @param minOutTarget Minimum alignment tokens to receive (slippage protection)
+     * @param minEthOutForFees Minimum ETH for the pending fee tokens; ignored when none are pending
      * @return lpPositionValue Total value of LP position added (ethSwapped + tokenReceived)
      */
     // ── Internal result structs for convertAndAddLiquidity helpers ──────────────
@@ -355,8 +363,9 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
 
     // slither-disable-next-line reentrancy-benign,reentrancy-eth
     function convertAndAddLiquidity(
-        uint256 minOutTarget
-    ) external nonReentrant returns (uint256 lpPositionValue) {
+        uint256 minOutTarget,
+        uint256 minEthOutForFees
+    ) external nonReentrant onlyKeeper returns (uint256 lpPositionValue) {
         if (minOutTarget == 0) revert AmountMustBePositive();
         if (totalPendingETH == 0) revert NoPendingETH();
         if (alignmentToken == address(0)) revert NoAlignmentTarget();
@@ -365,6 +374,7 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
         // LP yield accrued so far belongs to the current shareholders: book it before new shares are minted
         // (otherwise the modifyLiquidity below would also net those fees off silently, unaccounted).
         _collectAndAccumulateVaultFees(true);
+        _convertPendingFeeTokens(minEthOutForFees);
 
         int24 tickLower = TickMath.minUsableTick(v4PoolKey.tickSpacing);
         int24 tickUpper = TickMath.maxUsableTick(v4PoolKey.tickSpacing);
@@ -561,23 +571,18 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
         return (ethCollected, tokenCollected);
     }
 
+    /// @dev Swap the fee tokens waiting in the vault for ETH and credit it. Runs only inside keeper calls, before any
+    ///      share change, so fees stay with the holders who earned them.
     // slither-disable-next-line unused-return
-    function _convertVaultFeesToEth(uint256 tokenAmount) internal returns (uint256 ethReceived) {
-        if (tokenAmount == 0) return 0;
-
-        // Derive a TWAP-based minimum output to guard against sandwich attacks.
-        // If the validator has no price data (new pool / no history), minEthOut stays 0
-        // and the swap proceeds unguarded — acceptable as a rare edge case.
-        uint256 minEthOut = 0;
-        if (address(priceValidator) != address(0)) {
-            uint256 ethEstimate = priceValidator.quoteEthForTokens(alignmentToken, tokenAmount);
-            if (ethEstimate > 0) {
-                minEthOut = ethEstimate * (10000 - maxPriceDeviationBps) / 10000;
-            }
-        }
+    function _convertPendingFeeTokens(uint256 minEthOut) internal {
+        uint256 tokenAmount = pendingFeeTokens;
+        if (tokenAmount == 0) return;
+        if (minEthOut == 0) revert AmountMustBePositive();
+        pendingFeeTokens = 0;
 
         SafeTransferLib.safeApproveWithRetry(alignmentToken, zRouter, tokenAmount);
-        (, ethReceived) = IzRouterV4(zRouter).swapV4(
+        _setCollecting(true);
+        (, uint256 ethReceived) = IzRouterV4(zRouter).swapV4(
             address(this),
             false,
             zRouterFee,
@@ -588,6 +593,17 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
             minEthOut,
             type(uint256).max
         );
+        _setCollecting(false);
+        _creditYield(ethReceived);
+    }
+
+    /// @dev Protocol cut, then the rest pro rata to current shareholders.
+    function _creditYield(uint256 amount) internal {
+        if (amount == 0) return;
+        uint256 protocolCut = (amount * protocolYieldCutBps) / 10000; // round down: favors benefactors
+        _distributeFees(amount - protocolCut);
+        accumulatedProtocolFees += protocolCut;
+        if (protocolCut > 0) emit ProtocolYieldCollected(protocolCut);
     }
 
     // slither-disable-next-line incorrect-equality,reentrancy-benign,reentrancy-no-eth,timestamp
@@ -598,21 +614,20 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
 
             _setCollecting(true);
             (uint256 ethCollected, uint256 tokenCollected) = _claimVaultFees();
-            uint256 ethFromTokens = _convertVaultFeesToEth(tokenCollected);
             _setCollecting(false);
 
-            uint256 totalCollected = ethCollected + ethFromTokens;
-            if (totalCollected > 0) {
-                uint256 protocolCut = (totalCollected * protocolYieldCutBps) / 10000; // round down: favors benefactors
-                uint256 benefactorAmount = totalCollected - protocolCut;
-
-                _distributeFees(benefactorAmount);
-                accumulatedProtocolFees += protocolCut;
-
-                lastVaultFeeCollectionTime = block.timestamp;
-                if (protocolCut > 0) emit ProtocolYieldCollected(protocolCut);
-            }
+            // Fee tokens wait for the keeper: this path is open to anyone, so it must not swap.
+            pendingFeeTokens += tokenCollected;
+            _creditYield(ethCollected);
+            if (ethCollected + tokenCollected > 0) lastVaultFeeCollectionTime = block.timestamp;
         }
+    }
+
+    /// @notice Convert the fee tokens waiting in the vault when there is no pending ETH to convert.
+    /// @param minEthOut Minimum ETH to receive (slippage protection)
+    function convertFeeTokens(uint256 minEthOut) external nonReentrant onlyKeeper {
+        _collectAndAccumulateVaultFees(true);
+        _convertPendingFeeTokens(minEthOut);
     }
 
     /// @notice Claim accumulated LP yield fees for the caller

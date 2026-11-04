@@ -26,10 +26,11 @@ contract UniAlignmentVaultFeeAccountingTest is Test {
     address artistC = makeAddr("collectionC");
     address griefer = makeAddr("griefer");
     address keeper = makeAddr("keeper");
+    MiyaRegistry reg;
 
     function setUp() public {
         MockEXECToken token = new MockEXECToken(1_000_000e18);
-        MiyaRegistry reg = new MiyaRegistry(address(this), address(0xFEE), 100, 1000);
+        reg = new MiyaRegistry(address(this), address(0xFEE), 100, 1000);
         address[] memory toks = new address[](1);
         toks[0] = address(token);
         reg.addTarget("t", toks);
@@ -52,8 +53,9 @@ contract UniAlignmentVaultFeeAccountingTest is Test {
     }
 
     function _convert(address caller) internal {
+        reg.setConversionKeeper(caller);
         vm.prank(caller);
-        vault.convertAndAddLiquidity(1);
+        vault.convertAndAddLiquidity(1, 1);
     }
 
     /// H2: new shares must not dilute holders' UNCLAIMED past fees.

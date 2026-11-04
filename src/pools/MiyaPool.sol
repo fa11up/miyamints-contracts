@@ -31,15 +31,17 @@ interface IERC1155Pool {
  *         There are no fees, no admin, no pause and no upgrade path. The redeem mode is fixed at creation:
  *         - TARGETED: holders burn 1e18 tokens to withdraw a token id of their choice.
  *         - RANDOM (ERC721 only): holders burn tokens now and receive pseudo-random ids later, chosen with the
- *           hash of a block mined after the commit. Anyone can reveal.
+ *           hash of a block mined after the commit. Anyone can reveal, oldest commit first.
  *
  * @dev RANDOM-mode limitations (documented for the audit):
  *      - Randomness is a future block hash; block producers (the sequencer on L2s) can influence it.
  *      - If a commit is not revealed within the block-hash window (256 blocks via BLOCKHASH, 8191 via the
  *        EIP-2935 history contract) it is re-armed to a new future block. A committer who waits out the window
  *        therefore gets a re-roll; the long EIP-2935 window makes this slow but not impossible.
- *      - The index modulus is the holding count snapshotted at commit, so deposits made after the outcome block
- *        is known cannot shift the pick. Removals by other reveals in between can still move ids around.
+ *      - Each commit draws only from ids deposited before it, and reveals run in commit order, so once a target
+ *        block is mined the pick is fixed: later deposits and the choice of reveal order cannot move it.
+ *      - Because reveals are ordered, a commit must never block the ones after it: the recipient cannot be zero,
+ *        a commit is capped at MAX_COMMIT_UNITS, and an id the collection refuses to transfer is escrowed.
  *      NFTs sent with plain `transferFrom` (no receiver hook) are not tracked and cannot be recovered.
  */
 contract MiyaPool is ERC20, ReentrancyGuard {
@@ -59,13 +61,15 @@ contract MiyaPool is ERC20, ReentrancyGuard {
         address recipient;
         uint64 targetBlock;
         uint32 amount;
-        uint32 snapshot;
+        uint32 queueEnd;
     }
 
     uint256 public constant UNIT = 1e18;
     /// @dev EIP-2935 block-hash history contract, same address on every chain that supports it.
     address internal constant HISTORY = 0x0000F90827F1C53a10cb7A02335B175320002935;
     uint256 internal constant HISTORY_WINDOW = 8191;
+    /// @notice Most ids one commit can draw, so a reveal always fits in a block.
+    uint256 public constant MAX_COMMIT_UNITS = 50;
 
     address public immutable factory;
     address public immutable collection;
@@ -82,12 +86,24 @@ contract MiyaPool is ERC20, ReentrancyGuard {
     uint256 public pendingUnits;
     uint256 public nextCommitId;
     mapping(uint256 commitId => Commit) public commits;
+    /// @notice The only commit that can be revealed now.
+    uint256 public nextRevealId;
+    /// @notice RANDOM only: ids the collection refused to transfer at reveal, claimable by their recipient.
+    mapping(uint256 id => address recipient) public escrowedTo;
+
+    /// @dev RANDOM only: ids in deposit order. Live entries are [_queueHead, _queueTail); a commit draws from
+    ///      [_queueHead, queueEnd), which stays exactly the ids it could draw at commit minus those already drawn.
+    mapping(uint256 position => uint256 id) internal _queue;
+    uint256 internal _queueHead;
+    uint256 internal _queueTail;
 
     event Deposited(address indexed from, address indexed to, uint256[] ids, uint256[] amounts);
     event Redeemed(address indexed by, address indexed to, uint256[] ids, uint256[] amounts);
     event RedeemCommitted(uint256 indexed commitId, address indexed by, address indexed to, uint256 amount, uint256 targetBlock);
     event RedeemRearmed(uint256 indexed commitId, uint256 targetBlock);
     event RedeemRevealed(uint256 indexed commitId, uint256[] ids);
+    event RedeemEscrowed(uint256 indexed commitId, address indexed recipient, uint256 id);
+    event EscrowClaimed(address indexed recipient, address indexed to, uint256 id);
 
     error NotCollection();
     error WrongMode();
@@ -97,6 +113,10 @@ contract MiyaPool is ERC20, ReentrancyGuard {
     error InsufficientHeld();
     error TooEarly();
     error UnknownCommit();
+    error NotNextCommit();
+    error CommitTooLarge();
+    error InvalidRecipient();
+    error NotEscrowed();
     error TransferNotReceived(uint256 id);
 
     constructor(address _collection, Kind _kind, RedeemMode _mode) {
@@ -163,6 +183,7 @@ contract MiyaPool is ERC20, ReentrancyGuard {
         if (msg.sender != collection || kind != Kind.ERC721) revert NotCollection();
         if (IERC721Pool(collection).ownerOf(id) != address(this)) revert TransferNotReceived(id);
         _ids.add(id);
+        if (mode == RedeemMode.RANDOM) _queue[_queueTail++] = id;
         address to = _recipient(from, data);
         _mint(to, UNIT);
         uint256[] memory ids = new uint256[](1);
@@ -247,21 +268,24 @@ contract MiyaPool is ERC20, ReentrancyGuard {
     /// @notice Burn `amount` * UNIT tokens now; `amount` random ids go to `to` once the commit is revealed.
     function commitRedeem(uint256 amount, address to) external nonReentrant returns (uint256 commitId) {
         if (mode != RedeemMode.RANDOM) revert WrongMode();
-        if (amount == 0 || amount > type(uint32).max) revert EmptyRequest();
+        if (amount == 0) revert EmptyRequest();
+        if (amount > MAX_COMMIT_UNITS) revert CommitTooLarge();
+        if (to == address(0)) revert InvalidRecipient();
         uint256 held = _ids.length();
         if (held < pendingUnits + amount) revert InsufficientHeld();
         _burn(msg.sender, UNIT * amount);
         pendingUnits += amount;
         commitId = nextCommitId++;
         uint256 target = block.number + 1;
-        commits[commitId] = Commit(to, uint64(target), uint32(amount), uint32(held));
+        commits[commitId] = Commit(to, uint64(target), uint32(amount), uint32(_queueTail));
         emit RedeemCommitted(commitId, msg.sender, to, amount, target);
     }
 
-    /// @notice Settle a commit. Callable by anyone once its target block is mined.
+    /// @notice Settle the oldest unsettled commit. Callable by anyone once its target block is mined.
     function revealRedeem(uint256 commitId) external nonReentrant {
         Commit memory c = commits[commitId];
         if (c.amount == 0) revert UnknownCommit();
+        if (commitId != nextRevealId) revert NotNextCommit();
         if (block.number <= c.targetBlock) revert TooEarly();
         bytes32 seed = _blockHash(c.targetBlock);
         if (seed == bytes32(0)) {
@@ -271,22 +295,38 @@ contract MiyaPool is ERC20, ReentrancyGuard {
             return;
         }
         delete commits[commitId];
+        nextRevealId = commitId + 1;
         pendingUnits -= c.amount;
 
         uint256[] memory picked = new uint256[](c.amount);
+        uint256 head = _queueHead;
         for (uint256 i; i < c.amount; ++i) {
-            uint256 len = _ids.length();
             uint256 r = uint256(keccak256(abi.encode(seed, address(this), commitId, i)));
-            uint256 idx = r % c.snapshot;
-            if (idx >= len) idx %= len;
-            uint256 id = _ids.at(idx);
+            uint256 pos = head + r % (c.queueEnd - head);
+            uint256 id = _queue[pos];
+            _queue[pos] = _queue[head];
+            delete _queue[head];
+            ++head;
             _ids.remove(id);
             picked[i] = id;
         }
+        _queueHead = head;
         for (uint256 i; i < picked.length; ++i) {
-            IERC721Pool(collection).transferFrom(address(this), c.recipient, picked[i]);
+            try IERC721Pool(collection).transferFrom(address(this), c.recipient, picked[i]) {}
+            catch {
+                escrowedTo[picked[i]] = c.recipient;
+                emit RedeemEscrowed(commitId, c.recipient, picked[i]);
+            }
         }
         emit RedeemRevealed(commitId, picked);
+    }
+
+    /// @notice Take an id the collection refused to send to the caller at reveal, to any address.
+    function claimEscrowed(uint256 id, address to) external nonReentrant {
+        if (escrowedTo[id] != msg.sender) revert NotEscrowed();
+        delete escrowedTo[id];
+        IERC721Pool(collection).transferFrom(address(this), to, id);
+        emit EscrowClaimed(msg.sender, to, id);
     }
 
     // ┌─────────────────────────┐

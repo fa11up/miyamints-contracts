@@ -16,16 +16,60 @@ import { MiyaPoolFactory } from "../../src/pools/MiyaPoolFactory.sol";
 import { MiyaPool } from "../../src/pools/MiyaPool.sol";
 import { FreeMintParams } from "../../src/interfaces/IFactoryTypes.sol";
 import { GatingScope } from "../../src/gating/IGatingModule.sol";
+import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
+import { IUnlockCallback } from "v4-core/interfaces/callback/IUnlockCallback.sol";
+import { IHooks } from "v4-core/interfaces/IHooks.sol";
+import { BalanceDelta } from "v4-core/types/BalanceDelta.sol";
+import { Currency } from "v4-core/types/Currency.sol";
+import { PoolKey } from "v4-core/types/PoolKey.sol";
+import { TickMath } from "v4-core/libraries/TickMath.sol";
+
+/// @dev Seeds the hookless ETH/INFER pool the launch needs, as the real launch will before deploying.
+contract InferPoolSeeder is IUnlockCallback {
+    IPoolManager constant MANAGER = IPoolManager(0x000000000004444c5dc75cB358380D2e3dE08A90);
+    address immutable infer;
+
+    constructor(address infer_) {
+        infer = infer_;
+    }
+
+    function _key() internal view returns (PoolKey memory) {
+        return PoolKey(Currency.wrap(address(0)), Currency.wrap(infer), 10000, 200, IHooks(address(0)));
+    }
+
+    /// @dev About 2.7M INFER per ETH, close to the 0x price on 2026-11-04.
+    function seed() external payable {
+        MANAGER.initialize(_key(), uint160(1643) << 96);
+        MANAGER.unlock("");
+    }
+
+    function unlockCallback(bytes calldata) external returns (bytes memory) {
+        int24 lower = TickMath.minUsableTick(200);
+        int24 upper = TickMath.maxUsableTick(200);
+        (BalanceDelta delta,) =
+            MANAGER.modifyLiquidity(_key(), IPoolManager.ModifyLiquidityParams(lower, upper, 8_000e18, 0), "");
+        MANAGER.settle{ value: uint256(int256(-delta.amount0())) }();
+        MANAGER.sync(Currency.wrap(infer));
+        (bool ok,) = infer.call(
+            abi.encodeWithSignature("transfer(address,uint256)", address(MANAGER), uint256(int256(-delta.amount1())))
+        );
+        require(ok, "infer transfer");
+        MANAGER.settle();
+        return "";
+    }
+
+    receive() external payable { }
+}
 
 /// @notice Runs script/DeployMiyamints.s.sol against an Ethereum mainnet fork (real CreateX, Uniswap v4
-///         PoolManager, zRouter, CULT pool, imdUSD Treasury), then proves the deployed system end to end: an ERC721
+///         PoolManager, zRouter, a seeded ETH/INFER pool, imdUSD Treasury), then proves the deployed system end to end: an ERC721
 ///         drop + mint + split, an auction, a music ERC1155 collection + addEdition + mint (the app's exact calls),
-///         a MiyaPool deposit, and the default vault converting real ETH into CULT/ETH v4 liquidity.
+///         a MiyaPool deposit, and the default vault converting real ETH into ETH/INFER v4 liquidity (keeper only).
 ///         RPC: MAINNET_RPC_URL (default https://ethereum-rpc.publicnode.com); FORK_BLOCK pins a block.
 ///         Skipped (not failed) when the RPC is unreachable or SKIP_FORK_TESTS=true.
 contract DeployMiyamintsForkTest is Test {
     address constant TREASURY = 0x6Ac8fF96Fb8DCF5d79A8eF1E59D9AC23f2BD27Bc;
-    address constant CULT = 0x0000000000c5dc95539589fbD24BE07c6C14eCa4;
+    address constant INFER = 0x53d0eA0A685220718Dc6a0a6e4617194C6F37921;
 
     DeployMiyamints.Deployment d;
     bool forked;
@@ -34,6 +78,7 @@ contract DeployMiyamintsForkTest is Test {
     address safe = makeAddr("safe");
     address artist = makeAddr("artist");
     address buyer = makeAddr("buyer");
+    address keeper = makeAddr("keeper");
 
     function setUp() public {
         if (vm.envOr("SKIP_FORK_TESTS", false)) return;
@@ -49,6 +94,12 @@ contract DeployMiyamintsForkTest is Test {
             return;
         }
 
+        InferPoolSeeder seeder = new InferPoolSeeder(INFER);
+        deal(INFER, address(seeder), 100_000_000e18);
+        vm.deal(address(this), 100 ether);
+        seeder.seed{ value: 100 ether }();
+
+        vm.setEnv("KEEPER", vm.toString(keeper));
         vm.deal(deployer, 10 ether);
         DeployMiyamints script = new DeployMiyamints();
         d = script.runAs(deployer, safe);
@@ -73,7 +124,8 @@ contract DeployMiyamintsForkTest is Test {
         assertEq(UniAlignmentVaultFactory(d.vaultFactory).owner(), safe);
         assertEq(ERC1155Factory(d.erc1155Factory).owner(), safe);
         assertEq(ERC721AuctionFactory(d.auctionFactory).owner(), safe);
-        assertEq(d.alignmentToken, CULT);
+        assertEq(d.alignmentToken, INFER);
+        assertEq(r.conversionKeeper(), keeper);
         assertTrue(r.isVault(d.defaultVault));
         assertEq(UniAlignmentVault(payable(d.defaultVault)).protocolTreasury(), TREASURY);
         assertEq(d.gatingModule, address(0));
@@ -200,7 +252,7 @@ contract DeployMiyamintsForkTest is Test {
         assertTrue(pool != address(0));
     }
 
-    // ── the default vault against the real CULT/ETH v4 pool via the real zRouter ──
+    // ── the default vault against the seeded ETH/INFER v4 pool via the real zRouter ──
 
     function test_fork_defaultVault_convertsIntoRealPool() public onFork {
         ERC721DropInstance drop = _drop();
@@ -210,8 +262,12 @@ contract DeployMiyamintsForkTest is Test {
 
         UniAlignmentVault v = UniAlignmentVault(payable(d.defaultVault));
         assertEq(v.totalPendingETH(), 0.2 ether);
-        vm.prank(makeAddr("keeper"));
-        uint256 lpValue = v.convertAndAddLiquidity(1);
+        vm.prank(buyer);
+        vm.expectRevert(UniAlignmentVault.NotKeeper.selector);
+        v.convertAndAddLiquidity(1, 1);
+
+        vm.prank(keeper);
+        uint256 lpValue = v.convertAndAddLiquidity(1, 1);
         assertGt(lpValue, 0);
         assertEq(v.totalPendingETH(), 0);
         assertGt(v.benefactorShares(address(drop)), 0, "drop holds vault shares");

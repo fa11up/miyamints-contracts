@@ -25,6 +25,8 @@ contract MiyaRegistry is Ownable, IMiyaRegistry {
     }
 
     address public treasury;
+    /// @notice The only address allowed to run vault swaps (see UniAlignmentVault). Unset = conversions paused.
+    address public conversionKeeper;
     uint16 public protocolFeeBps;
     uint16 public minAlignmentBps;
 
@@ -42,6 +44,7 @@ contract MiyaRegistry is Ownable, IMiyaRegistry {
     address[] public instances;
 
     event TreasuryUpdated(address treasury);
+    event ConversionKeeperUpdated(address keeper);
     event FeesUpdated(uint16 protocolFeeBps, uint16 minAlignmentBps);
     event TargetAdded(uint256 indexed targetId, string name, address[] tokens);
     event TargetActiveSet(uint256 indexed targetId, bool active);
@@ -69,6 +72,11 @@ contract MiyaRegistry is Ownable, IMiyaRegistry {
 
     function setTreasury(address treasury_) external onlyOwner {
         _setTreasury(treasury_);
+    }
+
+    function setConversionKeeper(address keeper) external onlyOwner {
+        conversionKeeper = keeper;
+        emit ConversionKeeperUpdated(keeper);
     }
 
     function setFees(uint16 protocolFeeBps_, uint16 minAlignmentBps_) external onlyOwner {

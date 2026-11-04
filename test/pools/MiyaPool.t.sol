@@ -25,6 +25,19 @@ contract Mock721 is ERC721 {
     }
 }
 
+/// @dev A collection that refuses transfers to a blocked address.
+contract Blocking721 is Mock721 {
+    address public blocked;
+
+    function setBlocked(address who) external {
+        blocked = who;
+    }
+
+    function _beforeTokenTransfer(address, address to, uint256) internal view override {
+        require(to == address(0) || to != blocked, "blocked");
+    }
+}
+
 contract Mock1155 is ERC1155 {
     function uri(uint256) public pure override returns (string memory) {
         return "";
@@ -424,5 +437,161 @@ contract MiyaPoolTest is Test {
         r[1] = b;
         r[2] = c;
         r[3] = d;
+    }
+
+    // ── M1: nothing moves a pick once its target block is mined ─────────────
+
+    function _mined(MiyaPool pool, uint256 commitId, bytes32 seed) internal {
+        (, uint64 target,,) = pool.commits(commitId);
+        if (block.number <= target) vm.roll(target + 1);
+        vm.setBlockhash(target, seed);
+    }
+
+    function test_random_revealsRunInCommitOrder() public {
+        MiyaPool pool = _pool721(MiyaPool.RedeemMode.RANDOM);
+        vm.startPrank(alice);
+        pool.deposit(_ids(1, 2, 3), _none(), alice);
+        uint256 first = pool.commitRedeem(1, alice);
+        uint256 second = pool.commitRedeem(1, bob);
+        vm.stopPrank();
+        _mined(pool, first, keccak256("a"));
+        _mined(pool, second, keccak256("b"));
+
+        vm.expectRevert(MiyaPool.NotNextCommit.selector);
+        pool.revealRedeem(second);
+        pool.revealRedeem(first);
+        assertEq(pool.nextRevealId(), second);
+        pool.revealRedeem(second);
+    }
+
+    function test_random_depositsAfterACommitAreNeverDrawn() public {
+        MiyaPool pool = _pool721(MiyaPool.RedeemMode.RANDOM);
+        vm.startPrank(alice);
+        pool.deposit(_ids(1, 2, 3), _none(), alice);
+        uint256 id = pool.commitRedeem(3, bob);
+        pool.deposit(_ids(4, 5, 6), _none(), alice);
+        vm.stopPrank();
+        _mined(pool, id, keccak256("x"));
+        pool.revealRedeem(id);
+        for (uint256 tokenId = 1; tokenId <= 3; ++tokenId) assertEq(nft.ownerOf(tokenId), bob);
+        for (uint256 tokenId = 4; tokenId <= 6; ++tokenId) assertEq(nft.ownerOf(tokenId), address(pool));
+    }
+
+    /// The M1 attack: with both outcomes public, deposit between two reveals to change what the second one gets.
+    function testFuzz_random_depositBetweenRevealsCannotSteer(bytes32 seedA, bytes32 seedB) public {
+        vm.assume(seedA != 0 && seedB != 0);
+        MiyaPool pool = _pool721(MiyaPool.RedeemMode.RANDOM);
+        vm.startPrank(alice);
+        pool.deposit(_ids(1, 2, 3, 4), _none(), alice);
+        uint256 first = pool.commitRedeem(2, makeAddr("first"));
+        uint256 second = pool.commitRedeem(1, bob);
+        vm.stopPrank();
+        _mined(pool, first, seedA);
+        _mined(pool, second, seedB);
+
+        uint256 snap = vm.snapshotState();
+        pool.revealRedeem(first);
+        pool.revealRedeem(second);
+        uint256 honest = _onlyTokenOf(bob);
+        vm.revertToState(snap);
+
+        vm.prank(alice);
+        pool.deposit(_ids(5, 6), _none(), alice);
+        pool.revealRedeem(first);
+        vm.prank(alice);
+        pool.deposit(_ids(7), _none(), alice);
+        pool.revealRedeem(second);
+        assertEq(_onlyTokenOf(bob), honest, "a deposit steered the pick");
+    }
+
+    function testFuzz_random_everyDrawIsDistinctAndEligible(bytes32 seed, uint8 extra) public {
+        MiyaPool pool = _pool721(MiyaPool.RedeemMode.RANDOM);
+        uint256 late = bound(extra, 0, 4);
+        vm.startPrank(alice);
+        pool.deposit(_ids(1, 2, 3), _none(), alice);
+        uint256 a = pool.commitRedeem(2, bob);
+        pool.deposit(_ids(4, 5, 6), _none(), alice);
+        uint256 b = pool.commitRedeem(3, bob);
+        if (late > 0) pool.deposit(_ids(7), _none(), alice);
+        vm.stopPrank();
+        _mined(pool, a, keccak256(abi.encode(seed, 1)));
+        _mined(pool, b, keccak256(abi.encode(seed, 2)));
+        pool.revealRedeem(a);
+        pool.revealRedeem(b);
+        assertEq(nft.balanceOf(bob), 5);
+        assertEq(pool.pendingUnits(), 0);
+        if (late > 0) assertEq(nft.ownerOf(7), address(pool));
+        _assertBacked(pool);
+    }
+
+    // ── ordered reveals must not be blockable ───────────────────────────────
+
+    function test_random_zeroRecipientReverts() public {
+        MiyaPool pool = _pool721(MiyaPool.RedeemMode.RANDOM);
+        vm.startPrank(alice);
+        pool.deposit(_ids(1), _none(), alice);
+        vm.expectRevert(MiyaPool.InvalidRecipient.selector);
+        pool.commitRedeem(1, address(0));
+        vm.stopPrank();
+    }
+
+    function test_random_commitIsCapped() public {
+        MiyaPool pool = _pool721(MiyaPool.RedeemMode.RANDOM);
+        uint256 cap = pool.MAX_COMMIT_UNITS();
+        vm.prank(alice);
+        vm.expectRevert(MiyaPool.CommitTooLarge.selector);
+        pool.commitRedeem(cap + 1, alice);
+    }
+
+    function test_random_largestRevealFitsInABlock() public {
+        MiyaPool pool = _pool721(MiyaPool.RedeemMode.RANDOM);
+        uint256 cap = pool.MAX_COMMIT_UNITS();
+        for (uint256 tokenId = 100; tokenId < 100 + cap; ++tokenId) nft.mint(alice, tokenId);
+        uint256[] memory ids = new uint256[](cap);
+        for (uint256 i; i < cap; ++i) ids[i] = 100 + i;
+        vm.startPrank(alice);
+        nft.setApprovalForAll(address(pool), true);
+        pool.deposit(ids, _none(), alice);
+        uint256 id = pool.commitRedeem(cap, bob);
+        vm.stopPrank();
+        _mined(pool, id, keccak256("big"));
+        uint256 start = gasleft();
+        pool.revealRedeem(id);
+        assertLt(start - gasleft(), 10_000_000, "reveal must stay well under the block gas limit");
+    }
+
+    function test_random_refusedTransferIsEscrowedAndDoesNotBlockTheQueue() public {
+        Blocking721 blocking = new Blocking721();
+        address stuck = makeAddr("stuck");
+        blocking.setBlocked(stuck);
+        for (uint256 tokenId = 1; tokenId <= 2; ++tokenId) blocking.mint(alice, tokenId);
+        MiyaPool pool = MiyaPool(factory.createPool(address(blocking), MiyaPool.RedeemMode.RANDOM));
+        vm.startPrank(alice);
+        blocking.setApprovalForAll(address(pool), true);
+        pool.deposit(_ids(1, 2), _none(), alice);
+        uint256 first = pool.commitRedeem(1, stuck);
+        uint256 second = pool.commitRedeem(1, bob);
+        vm.stopPrank();
+        _mined(pool, first, keccak256("a"));
+        _mined(pool, second, keccak256("b"));
+
+        pool.revealRedeem(first);
+        pool.revealRedeem(second);
+        assertEq(blocking.balanceOf(bob), 1, "the next commit still settled");
+
+        uint256 escrowed = blocking.ownerOf(1) == address(pool) ? 1 : 2;
+        assertEq(blocking.ownerOf(escrowed), address(pool));
+        assertEq(pool.escrowedTo(escrowed), stuck);
+        assertEq(pool.heldUnits(), 0);
+
+        vm.prank(alice);
+        vm.expectRevert(MiyaPool.NotEscrowed.selector);
+        pool.claimEscrowed(escrowed, alice);
+
+        address elsewhere = makeAddr("elsewhere");
+        vm.prank(stuck);
+        pool.claimEscrowed(escrowed, elsewhere);
+        assertEq(blocking.ownerOf(escrowed), elsewhere);
+        assertEq(pool.escrowedTo(escrowed), address(0));
     }
 }

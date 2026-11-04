@@ -8,6 +8,7 @@ interface IMiyaRegistry {
     // ── fees ────────────────────────────────────────────────────────────────
     /// @notice Where protocol fees go (the imdUSD treasury on mainnet).
     function treasury() external view returns (address);
+    function conversionKeeper() external view returns (address);
 
     /// @notice Protocol fee in basis points, snapshotted by each collection at launch.
     function protocolFeeBps() external view returns (uint16);

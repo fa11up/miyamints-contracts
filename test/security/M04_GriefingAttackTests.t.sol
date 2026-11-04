@@ -30,7 +30,7 @@ contract GrieferAlwaysReverts {
 
     function attemptConversion(uint256 minOut) external {
         // This will execute all the conversion work
-        vault.convertAndAddLiquidity(minOut);
+        vault.convertAndAddLiquidity(minOut, 1);
         // But our receive() will revert when reward is sent
     }
 
@@ -55,7 +55,7 @@ contract GrieferConditional {
     }
 
     function attemptConversion(uint256 minOut) external {
-        vault.convertAndAddLiquidity(minOut);
+        vault.convertAndAddLiquidity(minOut, 1);
     }
 
     receive() external payable {
@@ -77,7 +77,7 @@ contract GrieferOutOfGas {
     }
 
     function attemptConversion(uint256 minOut) external {
-        vault.convertAndAddLiquidity(minOut);
+        vault.convertAndAddLiquidity(minOut, 1);
     }
 
     receive() external payable {
@@ -97,7 +97,7 @@ contract GoodCaller {
     }
 
     function callConversion(uint256 minOut) external {
-        vault.convertAndAddLiquidity(minOut);
+        vault.convertAndAddLiquidity(minOut, 1);
     }
 
     receive() external payable {
@@ -203,6 +203,7 @@ contract M04_GriefingAttackTests is Test {
 
         // Attack: Griefer tries to block conversion by rejecting reward
         // ✅ KEY TEST: This should NOT revert (pre-fix it would have reverted)
+        alignmentRegistry.setConversionKeeper(address(griefer));
         griefer.attemptConversion(1);
 
         // ✅ VERIFY: Operation succeeded despite griefing attempt
@@ -233,6 +234,7 @@ contract M04_GriefingAttackTests is Test {
         griefer.setGriefing(true);
 
         // Attack should fail to block operation
+        alignmentRegistry.setConversionKeeper(address(griefer));
         griefer.attemptConversion(1);
 
         // Verify conversion completed
@@ -250,6 +252,7 @@ contract M04_GriefingAttackTests is Test {
         GrieferOutOfGas griefer = new GrieferOutOfGas(vault);
 
         // Attack: Out of gas on receive (accidental griefing)
+        alignmentRegistry.setConversionKeeper(address(griefer));
         griefer.attemptConversion(1);
 
         // Verify operation succeeded
@@ -272,8 +275,9 @@ contract M04_GriefingAttackTests is Test {
         uint256 balanceBefore = caller.balance;
 
         // Legitimate call - should receive reward
+        alignmentRegistry.setConversionKeeper(caller);
         vm.prank(caller);
-        vault.convertAndAddLiquidity(1);
+        vault.convertAndAddLiquidity(1, 1);
 
         // Verify caller received reward
         uint256 balanceAfter = caller.balance;
@@ -298,6 +302,7 @@ contract M04_GriefingAttackTests is Test {
         uint256 balanceBefore = address(goodCaller).balance;
 
         // Legitimate call
+        alignmentRegistry.setConversionKeeper(address(goodCaller));
         goodCaller.callConversion(1);
 
         // Verify reward received
@@ -341,8 +346,9 @@ contract M04_GriefingAttackTests is Test {
         assertTrue(s1);
 
         address caller = makeAddr("poorCaller");
+        alignmentRegistry.setConversionKeeper(caller);
         vm.prank(caller);
-        poorVault.convertAndAddLiquidity(1);
+        poorVault.convertAndAddLiquidity(1, 1);
 
         assertEq(poorVault.totalPendingETH(), 0, "Conversion completed");
         assertGt(poorVault.benefactorShares(alice), 0, "Shares issued");
@@ -360,8 +366,9 @@ contract M04_GriefingAttackTests is Test {
 
         address caller = makeAddr("rewardTester");
         vm.txGasPrice(10_000 gwei);
+        alignmentRegistry.setConversionKeeper(caller);
         vm.prank(caller);
-        vault.convertAndAddLiquidity(1);
+        vault.convertAndAddLiquidity(1, 1);
 
         assertEq(caller.balance, vault.CONVERSION_REWARD(), "Reward independent of tx.gasprice");
     }
@@ -373,8 +380,9 @@ contract M04_GriefingAttackTests is Test {
         assertTrue(s1);
 
         address caller = makeAddr("smallBatchCaller");
+        alignmentRegistry.setConversionKeeper(caller);
         vm.prank(caller);
-        vault.convertAndAddLiquidity(1);
+        vault.convertAndAddLiquidity(1, 1);
 
         assertEq(caller.balance, 0.0001 ether, "Reward capped at 1% of a small batch");
     }

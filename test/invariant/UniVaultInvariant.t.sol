@@ -73,6 +73,7 @@ contract UniVaultInvariantTest is StdInvariant, Test {
 
         handler = new UniVaultHandler(vault, actors);
 
+        alignmentRegistry.setConversionKeeper(address(handler));
         targetContract(address(handler));
     }
 

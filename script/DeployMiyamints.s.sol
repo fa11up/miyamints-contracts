@@ -72,6 +72,7 @@ contract DeployMiyamints is Script {
         uint32 twapSeconds;
         string alignmentTargetName;
         address alignmentToken;
+        address keeper;
         bool deployMockAlignmentToken;
         bool deployGatingModule;
         bool allowMissingPool;
@@ -157,6 +158,7 @@ contract DeployMiyamints is Script {
         c.twapSeconds = uint32(vm.parseJsonUint(json, ".twapSeconds"));
         c.alignmentTargetName = vm.envOr("ALIGNMENT_TARGET_NAME", vm.parseJsonString(json, ".alignmentTargetName"));
         c.alignmentToken = vm.envOr("ALIGNMENT_TOKEN", vm.parseJsonAddress(json, ".alignmentToken"));
+        c.keeper = vm.envOr("KEEPER", address(0));
         c.deployMockAlignmentToken = vm.parseJsonBool(json, ".deployMockAlignmentToken");
         c.deployGatingModule = vm.envOr("DEPLOY_GATING_MODULE", vm.parseJsonBool(json, ".deployGatingModule"));
         c.allowMissingPool = vm.envOr("ALLOW_MISSING_POOL", c.deployMockAlignmentToken);
@@ -249,6 +251,8 @@ contract DeployMiyamints is Script {
         d.poolFactory = _create3(deployer, c.saltNamespace, "MiyaPoolFactory", type(MiyaPoolFactory).creationCode);
 
         // 9. Registry wiring.
+        // Unset KEEPER leaves vault conversions paused until the owner calls setConversionKeeper.
+        registry.setConversionKeeper(c.keeper);
         registry.setVaultFactory(d.vaultFactory, true);
         registry.setFactory(d.dropFactory, true);
         registry.setFactory(d.auctionFactory, true);
