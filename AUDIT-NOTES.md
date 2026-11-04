@@ -23,7 +23,7 @@ demonstrated each fixed bug on 88641a8; here they assert the fixed behaviour.
 ## What changed
 
 **H1** — `receive()` returns early while a transient flag (`_COLLECTING_SLOT`, TSTORE/TLOAD) is set; the flag
-wraps only the internal collection (`_claimVaultFees` + `_convertVaultFeesToEth`). One TLOAD keeps 2300-gas
+wraps only the internal collection (`_claimVaultFees`) and the keeper's fee-token swap (`_convertPendingFeeTokens`). One TLOAD keeps 2300-gas
 `transfer` senders working. Test: `test/vaults/UniAlignmentVaultRealV4.t.sol` (real v4 `PoolManager`; this file
 compiles as a separate solc 0.8.26 unit, see `foundry.toml`).
 
