@@ -78,14 +78,15 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
     error TreasuryNotSet();
     error AmountMismatch();
     error ContributionBelowMinimum();
-    error TooManyConversionParticipants();
+    error InsufficientOutput();
     error PoolKeyAlreadySet();
     error HooksNotAllowed();
     error NotKeeper();
 
     // ── Anti-DoS constants ────────────────────────────────────────────────
     uint256 public constant MIN_CONTRIBUTION = 0.001 ether;
-    uint256 public constant MAX_CONVERSION_PARTICIPANTS = 500;
+    uint256 private constant MAX_LP_PASSES = 3;
+    uint256 private constant LP_PASS_MIN_DIVISOR = 200; // another pass needs 0.5% of the batch still to swap
 
     // ── Fee accounting ────────────────────────────────────────────────────
     /// @dev Scale for accFeePerShare. Shares are V4 liquidity units, so a high scale keeps per-share
@@ -111,11 +112,11 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
     // Track total ETH contributed per benefactor (for bragging rights)
     mapping(address => uint256) public benefactorTotalETH;
 
-    // Track shares issued to benefactors (for fee claims)
-    mapping(address => uint256) public benefactorShares;
+    // Shares a benefactor has collected. benefactorShares() adds any from a batch that has converted since.
+    mapping(address => uint256) internal _shares;
 
     // MasterChef-style fee accounting: a benefactor is owed
-    //   settledFees[b] + benefactorShares[b] * (accFeePerShare - feeCheckpoint[b]) / ACC_PRECISION
+    //   settledFees[b] + _shares[b] * (accFeePerShare - feeCheckpoint[b]) / ACC_PRECISION
     // Pending fees are settled into settledFees (and the checkpoint advanced) before any change to the
     // benefactor's shares. Checkpointing the per-share index rather than a rounded reward debt means each
     // payout rounds down only once, so sum(payouts) can never exceed fees distributed.
@@ -123,8 +124,19 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
     mapping(address => uint256) public settledFees;
     mapping(address => uint256) public lastClaimTimestamp;
 
-    // Track pending contributions in current dragnet (reset after each conversion)
-    mapping(address => uint256) public pendingETH;
+    // Contributions are grouped into batches, and a conversion closes the open batch in one step, however many
+    // contributed: it records the batch's shares per ETH, and each benefactor collects theirs the next time they
+    // are touched (_settleFees). A benefactor is only ever in one uncollected batch, because contributing again
+    // collects the last one first.
+    struct ConvertedBatch {
+        uint256 sharesPerEth; // scaled by ACC_PRECISION
+        uint256 accFeePerShareAtClose; // new shares earn fees from here
+    }
+
+    mapping(uint256 batchId => ConvertedBatch) public convertedBatches;
+    uint256 public closedBatches; // the open batch is closedBatches + 1
+    mapping(address => uint256) internal _pendingBatch;
+    mapping(address => uint256) internal _pending; // ETH in _pendingBatch; pendingETH() hides it once converted
 
     // Benefactor delegation (fee routing)
     mapping(address => address) public benefactorDelegate;
@@ -148,14 +160,6 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
     // Protocol yield cut (paid to registry.treasury(), see protocolTreasury())
     uint256 public protocolYieldCutBps = 100; // 1% of LP yield
     uint256 public accumulatedProtocolFees;
-
-    // Dust accumulation
-    uint256 public accumulatedDustShares;
-    uint256 public dustDistributionThreshold = 1e18;
-
-    // Conversion participants tracking (dragnet)
-    address[] public conversionParticipants;
-    mapping(address => uint256) public lastConversionParticipantIndex;
 
     // External contracts (storage, not immutable — required for clone pattern)
     address public weth;
@@ -209,7 +213,6 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
         uint256 sharesIssued,
         uint256 callerReward
     );
-    event DustDistributed(address indexed recipient, uint256 dustShares);
 
     event ConversionRewardPaid(address indexed caller, uint256 reward);
     /// @dev A rejected reward is distributed to benefactors as fees instead of being stranded.
@@ -274,7 +277,6 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
         protocolYieldCutBps = 100;
         v3PreferredFee = 3000;
         vaultFeeCollectionInterval = 1 days;
-        dustDistributionThreshold = 1e18;
 
         try IERC20Metadata(_alignmentToken).decimals() returns (uint8 decimals) {
             alignmentTokenDecimals = decimals;
@@ -331,15 +333,13 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
 
     function _trackBenefactorContribution(address benefactor, uint256 amount) internal {
         if (amount < MIN_CONTRIBUTION) revert ContributionBelowMinimum();
-        if(pendingETH[benefactor] == 0){
-            if (conversionParticipants.length >= MAX_CONVERSION_PARTICIPANTS) revert TooManyConversionParticipants();
-            conversionParticipants.push(benefactor);
-        }
+        _settleFees(benefactor); // collects any batch of theirs that has converted
+        _pendingBatch[benefactor] = closedBatches + 1;
         if(benefactorTotalETH[benefactor] == 0){
             totalUniqueBenefactors++;
         }
         benefactorTotalETH[benefactor] += amount;
-        pendingETH[benefactor] += amount;
+        _pending[benefactor] += amount;
         totalPendingETH += amount;
     }
 
@@ -388,23 +388,13 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
             alignmentToken, lastTickLower, lastTickUpper, poolManager,
             bytes32(PoolId.unwrap(v4PoolKey.toId()))
         );
-        // An LP add can't use every wei: the amounts rarely match the pool's ratio exactly, and fees earned by the
-        // position net off what it pays in. So work from everything the vault holds beyond what it owes, which feeds
-        // any leftover from the last conversion into this one and keeps leftovers from building up.
-        uint256 owed = callerReward + accumulatedFees - totalFeesClaimed + accumulatedProtocolFees;
-        uint256 ethAvailable = address(this).balance - owed;
-        // Fee tokens were converted above, so every token held is left over.
-        uint256 tokensHeld = SafeTransferLib.balanceOf(alignmentToken, address(this)) - pendingFeeTokens;
-        uint256 ethToSwap = _ethToSwap(ethAvailable, tokensHeld, proportionToSwap);
+        SwapLPResult memory r = _swapAndAdd(callerReward, ethToAdd, proportionToSwap, minOutTarget, tickLower, tickUpper);
 
-        SwapLPResult memory r = _doSwapAndLP(owed, ethToSwap, minOutTarget, tickLower, tickUpper);
+        _closeBatch(ethPending, ethToAdd, r.liquidityUnitsAdded);
 
-        address[] memory activeBenefactors = _getActiveBenefactors();
-        _distributeSharesAndCleanup(ethPending, ethToAdd, r.liquidityUnitsAdded, activeBenefactors);
-
-        lpPositionValue = ethToSwap + r.targetTokenReceived;
+        lpPositionValue = ethToAdd + r.targetTokenReceived;
         _payCallerReward(callerReward);
-        emit LiquidityAdded(ethToSwap, r.targetTokenReceived, lpPositionValue, r.liquidityUnitsAdded, callerReward);
+        emit LiquidityAdded(ethToAdd, r.targetTokenReceived, lpPositionValue, r.liquidityUnitsAdded, callerReward);
     }
 
     /// @dev How much ETH to swap so the two sides end up in the right proportion, counting tokens already held.
@@ -414,13 +404,32 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
         returns (uint256)
     {
         uint256 target = (ethAvailable * proportionToSwap) / 1e18; // round down: excess stays as ethForLP
-        if (tokensHeld == 0) return target;
+        if (poolManager.code.length == 0) return target;
         (uint160 sqrtPriceX96, , ,) = StateLibrary.getSlot0(IPoolManager(poolManager), v4PoolKey.toId());
+        uint128 liquidity = StateLibrary.getLiquidity(IPoolManager(poolManager), v4PoolKey.toId());
+        if (sqrtPriceX96 != 0 && liquidity != 0) {
+            target = _balancedSwap(ethAvailable, FixedPointMathLib.fullMulDiv(liquidity, 1 << 96, sqrtPriceX96), target);
+        }
+        if (tokensHeld == 0) return target;
         uint256 tokenValue = FixedPointMathLib.fullMulDiv(
             FixedPointMathLib.fullMulDiv(tokensHeld, 1 << 96, sqrtPriceX96), 1 << 96, sqrtPriceX96
         );
         uint256 alreadyHeld = (tokenValue * (1e18 - proportionToSwap)) / 1e18;
         return target > alreadyHeld ? target - alreadyHeld : 0;
+    }
+
+    /// @dev The ETH to swap so what is left matches the pool's ratio after the swap has moved its price, for a pool
+    ///      with `ethReserve` of virtual ETH depth: the standard single-sided add formula. Near half for a small batch,
+    ///      and well under half for one that is large against the pool. `fallbackAmount` caps it, so a
+    ///      moved spot price can only shrink the swap, and covers depth too large to compute.
+    function _balancedSwap(uint256 eth, uint256 ethReserve, uint256 fallbackAmount) private view returns (uint256) {
+        if (ethReserve > 1e32 || eth > 1e32) return fallbackAmount;
+        uint256 afterFee = 1e6 - zRouterFee;
+        uint256 feeTerm = 2e6 - zRouterFee;
+        uint256 root = FixedPointMathLib.sqrt(ethReserve * (ethReserve * feeTerm * feeTerm + 4 * afterFee * 1e6 * eth));
+        uint256 base = ethReserve * feeTerm;
+        uint256 balanced = root > base ? (root - base) / (2 * afterFee) : 0;
+        return balanced < fallbackAmount ? balanced : fallbackAmount;
     }
 
     /// @dev Caller reward for converting a pending batch of `ethPending` wei
@@ -429,80 +438,64 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
         return cap < CONVERSION_REWARD ? cap : CONVERSION_REWARD;
     }
 
+    /// @dev Swap and add, then measure what is left and go again: how far a swap moves the price depends on liquidity
+    ///      a formula can't see (positions just out of range), so one estimate can leave a large part of a batch unpaired
+    ///      for the next batch to collect. The vault works from everything it holds beyond what it owes, which also
+    ///      feeds in what the last conversion left. `minOutTarget` applies to the tokens bought across all passes.
     // slither-disable-next-line arbitrary-send-eth,reentrancy-benign,unused-return
-    function _doSwapAndLP(
-        uint256 owed,
-        uint256 ethToSwap,
+    function _swapAndAdd(
+        uint256 callerReward,
+        uint256 ethToAdd,
+        uint256 proportionToSwap,
         uint256 minOutTarget,
         int24 tickLower,
         int24 tickUpper
     ) private returns (SwapLPResult memory r) {
-        if (ethToSwap != 0) {
-            // zRouter refunds its whole ETH balance to the payer at the end of the swap, so ETH can arrive here.
-            _setCollecting(true);
-            (, r.targetTokenReceived) = IzRouterV4(zRouter).swapV4{value: ethToSwap}(
-                address(this), false, zRouterFee, zRouterTickSpacing,
-                address(0), alignmentToken, ethToSwap, minOutTarget, type(uint256).max
-            );
-            _setCollecting(false);
+        uint256 owed = callerReward + accumulatedFees - totalFeesClaimed + accumulatedProtocolFees;
+        bool swapped;
+        for (uint256 pass; pass < MAX_LP_PASSES; ++pass) {
+            uint256 ethAvailable = address(this).balance - owed;
+            // Fee tokens not converted are spoken for; every other token held is free to add.
+            uint256 tokensHeld = SafeTransferLib.balanceOf(alignmentToken, address(this)) - pendingFeeTokens;
+            uint256 ethToSwap = _ethToSwap(ethAvailable, tokensHeld, proportionToSwap);
+            // Later passes only run for what is worth their gas.
+            if (pass != 0 && ethToSwap < ethToAdd / LP_PASS_MIN_DIVISOR) break;
+
+            if (ethToSwap != 0) {
+                // zRouter refunds its whole ETH balance to the payer at the end of the swap, so ETH can arrive here.
+                _setCollecting(true);
+                (, uint256 bought) = IzRouterV4(zRouter).swapV4{value: ethToSwap}(
+                    address(this), false, zRouterFee, zRouterTickSpacing,
+                    address(0), alignmentToken, ethToSwap, 0, type(uint256).max
+                );
+                _setCollecting(false);
+                r.targetTokenReceived += bought;
+                swapped = true;
+            }
+
+            uint256 ethForLP = address(this).balance - owed;
+            uint256 tokensForLP = SafeTransferLib.balanceOf(alignmentToken, address(this)) - pendingFeeTokens;
+            (uint256 amount0, uint256 amount1) = Currency.unwrap(v4PoolKey.currency0) == alignmentToken
+                ? (tokensForLP, ethForLP)
+                : (ethForLP, tokensForLP);
+            r.liquidityUnitsAdded += uint256(_addToLpPosition(amount0, amount1, tickLower, tickUpper));
         }
-
-        uint256 ethRemaining = address(this).balance - owed;
-        uint256 tokensForLP = SafeTransferLib.balanceOf(alignmentToken, address(this)) - pendingFeeTokens;
-        (uint256 amount0, uint256 amount1) = Currency.unwrap(v4PoolKey.currency0) == alignmentToken
-            ? (tokensForLP, ethRemaining)
-            : (ethRemaining, tokensForLP);
-
-        r.liquidityUnitsAdded = uint256(_addToLpPosition(amount0, amount1, tickLower, tickUpper));
+        if (swapped && r.targetTokenReceived < minOutTarget) revert InsufficientOutput();
         totalLPUnits += r.liquidityUnitsAdded;
     }
 
-    // slither-disable-next-line divide-before-multiply
-    function _distributeSharesAndCleanup(
-        uint256 ethPending,
-        uint256 ethAdded,
-        uint256 totalSharesIssued,
-        address[] memory activeBenefactors
-    ) private {
-        uint256 totalSharesActuallyIssued = 0;
-        address largestContributor = activeBenefactors[0];
-        uint256 largestContribution = 0;
-
-        for (uint256 i = 0; i < activeBenefactors.length; i++) {
-            address benefactor = activeBenefactors[i];
-            uint256 contribution = pendingETH[benefactor];
-
-            if (contribution > largestContribution) {
-                largestContribution = contribution;
-                largestContributor = benefactor;
-            }
-
-            uint256 sharePercent = (contribution * 1e18) / ethPending; // round down: dust tracked separately
-            uint256 sharesToIssue = (totalSharesIssued * sharePercent) / 1e18; // round down: dust accumulated and redistributed
-
-            // Book fees earned on the existing shares before the share balance changes.
-            _settleFees(benefactor);
-            benefactorShares[benefactor] += sharesToIssue;
-            totalShares += sharesToIssue;
-            totalSharesActuallyIssued += sharesToIssue;
-            pendingETH[benefactor] = 0;
-        }
-
-        uint256 dust = totalSharesIssued - totalSharesActuallyIssued;
-        accumulatedDustShares += dust;
-
-        if (accumulatedDustShares >= dustDistributionThreshold) {
-            uint256 dustToDistribute = accumulatedDustShares;
-            // Already settled in the loop above (it is an active benefactor); accFeePerShare is unchanged.
-            benefactorShares[largestContributor] += dustToDistribute;
-            totalShares += dustToDistribute;
-            accumulatedDustShares = 0;
-            emit DustDistributed(largestContributor, dustToDistribute);
-        }
-
+    /// @dev Costs the same however many contributed. Runs after this batch's fees and yield are booked, so new
+    ///      shares earn only from here on.
+    function _closeBatch(uint256 ethPending, uint256 ethAdded, uint256 sharesIssued) private {
+        uint256 batchId = closedBatches + 1;
+        convertedBatches[batchId] = ConvertedBatch({
+            sharesPerEth: FixedPointMathLib.fullMulDiv(sharesIssued, ACC_PRECISION, ethPending), // round down
+            accFeePerShareAtClose: accFeePerShare
+        });
+        closedBatches = batchId;
+        totalShares += sharesIssued;
         totalEthLocked += ethAdded;
         totalPendingETH = 0;
-        _clearConversionParticipants();
     }
 
     // slither-disable-next-line arbitrary-send-eth
@@ -533,16 +526,39 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
         emit FeesAccumulated(amount);
     }
 
-    /// @dev Fees earned by the benefactor's current shares since their last checkpoint
-    function _feesSinceCheckpoint(address benefactor) internal view returns (uint256) {
-        return FixedPointMathLib.fullMulDiv(
-            benefactorShares[benefactor], accFeePerShare - feeCheckpoint[benefactor], ACC_PRECISION
-        ); // round down: favors vault
+    /// @dev A benefactor's state as if any converted batch of theirs were collected: shares, the checkpoint they earn
+    ///      from, and fees earned before that batch's shares arrived.
+    function _collected(address benefactor)
+        private
+        view
+        returns (uint256 shares, uint256 checkpoint, uint256 earlierFees)
+    {
+        shares = _shares[benefactor];
+        checkpoint = feeCheckpoint[benefactor];
+        uint256 batchId = _pendingBatch[benefactor];
+        if (batchId == 0 || batchId > closedBatches) return (shares, checkpoint, 0);
+        ConvertedBatch storage batch = convertedBatches[batchId];
+        earlierFees = FixedPointMathLib.fullMulDiv(shares, batch.accFeePerShareAtClose - checkpoint, ACC_PRECISION);
+        shares += FixedPointMathLib.fullMulDiv(_pending[benefactor], batch.sharesPerEth, ACC_PRECISION); // round down
+        checkpoint = batch.accFeePerShareAtClose;
     }
 
-    /// @dev Move fees earned since the last checkpoint into settledFees. Must run before shares change.
+    /// @dev Fees owed beyond settledFees, rounded down (favors the vault).
+    function _feesSinceCheckpoint(address benefactor) internal view returns (uint256) {
+        (uint256 shares, uint256 checkpoint, uint256 earlierFees) = _collected(benefactor);
+        return earlierFees + FixedPointMathLib.fullMulDiv(shares, accFeePerShare - checkpoint, ACC_PRECISION);
+    }
+
+    /// @dev Collect any converted batch and move fees earned so far into settledFees.
     function _settleFees(address benefactor) internal {
         uint256 owed = _feesSinceCheckpoint(benefactor);
+        (uint256 shares, , ) = _collected(benefactor);
+        uint256 batchId = _pendingBatch[benefactor];
+        if (batchId != 0 && batchId <= closedBatches) {
+            _shares[benefactor] = shares;
+            delete _pending[benefactor];
+            delete _pendingBatch[benefactor];
+        }
         if (owed != 0) settledFees[benefactor] += owed;
         feeCheckpoint[benefactor] = accFeePerShare;
     }
@@ -605,8 +621,9 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
     // slither-disable-next-line unused-return
     function _convertPendingFeeTokens(uint256 minEthOut) internal {
         uint256 tokenAmount = pendingFeeTokens;
-        if (tokenAmount == 0) return;
-        if (minEthOut == 0) revert AmountMustBePositive();
+        // A floor of 0 means "leave them": fee tokens worth under 1 wei can't clear any floor, and must not block a
+        // conversion. The keeper converts them once they are worth converting.
+        if (tokenAmount == 0 || minEthOut == 0) return;
         pendingFeeTokens = 0;
 
         SafeTransferLib.safeApproveWithRetry(alignmentToken, zRouter, tokenAmount);
@@ -669,7 +686,7 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
 
         address benefactor = msg.sender;
 
-        if (benefactorShares[benefactor] == 0) revert NoShares();
+        if (benefactorShares(benefactor) == 0) revert NoShares();
 
         ethClaimed = _harvest(benefactor);
         if (ethClaimed == 0) revert NoFeesToClaim();
@@ -685,16 +702,6 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
     }
 
     // ========== Internal Helpers ==========
-
-    function _getActiveBenefactors() internal view returns (address[] memory) {
-        return conversionParticipants;
-    }
-
-    function _clearConversionParticipants() internal {
-        while (conversionParticipants.length > 0) {
-            conversionParticipants.pop();
-        }
-    }
 
     // slither-disable-next-line unused-return
     function _addToLpPosition(
@@ -825,6 +832,16 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
 
     // ========== Query Functions ==========
 
+    /// @notice Shares the benefactor holds, including any from a converted batch they have not yet touched
+    function benefactorShares(address benefactor) public view returns (uint256 shares) {
+        (shares, , ) = _collected(benefactor);
+    }
+
+    /// @notice ETH the benefactor has waiting for the next conversion
+    function pendingETH(address benefactor) public view returns (uint256) {
+        return _pendingBatch[benefactor] > closedBatches ? _pending[benefactor] : 0;
+    }
+
     function getBenefactorContribution(address benefactor)
         external
         view
@@ -840,7 +857,7 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
         override
         returns (uint256)
     {
-        return benefactorShares[benefactor];
+        return benefactorShares(benefactor);
     }
 
     /// @notice ETH the benefactor could claim now from fees already collected (excludes uncollected LP yield)
@@ -898,7 +915,7 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
     /// @dev Caller must be an existing benefactor. Set to address(0) to remove delegation.
     /// @param delegate Address that will receive fee payouts for the caller
     function delegateBenefactor(address delegate) external override {
-        if (benefactorShares[msg.sender] == 0 && benefactorTotalETH[msg.sender] == 0) revert NotBenefactor();
+        if (benefactorShares(msg.sender) == 0 && benefactorTotalETH[msg.sender] == 0) revert NotBenefactor();
         benefactorDelegate[msg.sender] = delegate;
         emit BenefactorDelegateSet(msg.sender, delegate);
     }
@@ -920,7 +937,7 @@ contract UniAlignmentVault is ReentrancyGuard, Ownable, IUnlockCallback, IAlignm
             address benefactor = benefactors[i];
 
             if (benefactorDelegate[benefactor] != msg.sender) revert NotDelegate();
-            if (benefactorShares[benefactor] == 0) revert NoShares();
+            if (benefactorShares(benefactor) == 0) revert NoShares();
 
             totalClaimed += _harvest(benefactor);
         }

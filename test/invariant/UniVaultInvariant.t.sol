@@ -85,11 +85,9 @@ contract UniVaultInvariantTest is StdInvariant, Test {
         for (uint256 i = 0; i < a.length; i++) {
             sumShares += vault.benefactorShares(a[i]);
         }
-        assertEq(
-            sumShares,
-            vault.totalShares(),
-            "Uni: sum(benefactorShares) != totalShares"
-        );
+        // Each benefactor's shares round down when collected from a batch, so the sum can fall short by a few wei.
+        assertLe(sumShares, vault.totalShares(), "Uni: sum(benefactorShares) > totalShares");
+        assertApproxEqAbs(sumShares, vault.totalShares(), a.length * (vault.closedBatches() + 1), "Uni: shares lost");
     }
 
     // ── Invariant 2: no phantom ETH ──

@@ -54,6 +54,10 @@ interface IUniswapV3Pool {
     function token1() external view returns (address);
 }
 
+interface IERC20Balance {
+    function balanceOf(address) external view returns (uint256);
+}
+
 contract UniswapVaultPriceValidator is IVaultPriceValidator {
     using StateLibrary for IPoolManager;
 
@@ -300,6 +304,12 @@ contract UniswapVaultPriceValidator is IVaultPriceValidator {
 
         address token0 = IUniswapV3Pool(pool).token0();
         if (!_hasReferenceDepth(spotSqrtPriceX96, poolLiquidity, token0 == weth)) {
+            return (false, 0, 0);
+        }
+        // A one-tick position reaches that virtual depth with dust, so it must also hold real WETH.
+        try IERC20Balance(weth).balanceOf(pool) returns (uint256 held) {
+            if (held < MIN_REFERENCE_WETH) return (false, 0, 0);
+        } catch {
             return (false, 0, 0);
         }
 

@@ -176,6 +176,150 @@ contract UniAlignmentVaultFeeAccountingTest is Test {
             }
         }
         assertLe(claimed, feesIn, "claims exceed fees");
-        assertApproxEqAbs(claimed, feesIn, 24 * 3, "fees stranded beyond rounding dust");
+        // Rounding per claim, plus the fees earned by a few wei of shares that round down when a batch is collected.
+        assertApproxEqAbs(claimed, feesIn, 24 * 3 + feesIn / 1e15, "fees stranded beyond rounding dust");
+    }
+
+    // ── audit round 2: batches close in one step ─────────────────────────────
+
+    function _freshContributors(uint256 from, uint256 count) internal {
+        for (uint256 i = from; i < from + count; ++i) {
+            address who = address(uint160(0x100000 + i));
+            uint256 minimum = vault.MIN_CONTRIBUTION();
+            vm.deal(who, 1 ether);
+            vm.prank(who);
+            (bool ok,) = address(vault).call{ value: minimum }("");
+            assertTrue(ok);
+        }
+    }
+
+    function _convertGas() internal returns (uint256 used) {
+        vm.prank(keeper);
+        uint256 before = gasleft();
+        vault.convertAndAddLiquidity(1, 1);
+        used = before - gasleft();
+    }
+
+    /// The final review's High: a batch's cost grew with its contributors, past mainnet's transaction gas cap.
+    function test_conversionCostDoesNotGrowWithContributors() public {
+        _contribute(artistA, 1 ether);
+        _convert(keeper);
+        vault.depositFees{ value: 1 ether }();
+
+        _freshContributors(0, 5);
+        uint256 few = _convertGas();
+        _freshContributors(100, 1500);
+        uint256 many = _convertGas();
+
+        assertLt(many, 1_000_000, "fits any block");
+        assertApproxEqAbs(many, few, 120_000, "same cost for 5 or 1500 contributors");
+        assertEq(vault.benefactorShares(address(uint160(0x100000 + 100))) > 0, true);
+    }
+
+    function test_batchSharesFollowEachContribution() public {
+        _contribute(artistA, 1 ether);
+        _contribute(artistB, 3 ether);
+        _convert(keeper);
+        assertApproxEqAbs(vault.benefactorShares(artistB), vault.benefactorShares(artistA) * 3, 4);
+        assertApproxEqAbs(vault.benefactorShares(artistA) + vault.benefactorShares(artistB), vault.totalShares(), 2);
+    }
+
+    function test_fewerSharesCanNeverBeClaimedThanIssuedRoundingOnly() public {
+        for (uint256 i; i < 7; ++i) {
+            address who = makeAddr(string(abi.encodePacked("r", i)));
+            vm.deal(who, 1 ether);
+            vm.prank(who);
+            (bool ok,) = address(vault).call{ value: 0.001 ether + i * 1e13 }("");
+            assertTrue(ok);
+        }
+        _convert(keeper);
+        uint256 sum;
+        for (uint256 i; i < 7; ++i) sum += vault.benefactorShares(makeAddr(string(abi.encodePacked("r", i))));
+        assertLe(sum, vault.totalShares());
+        assertApproxEqAbs(sum, vault.totalShares(), 7);
+    }
+
+    /// Someone who never touches the vault again still has the right shares and fees, across later batches.
+    function test_untouchedBenefactorKeepsSharesAndFees() public {
+        _contribute(artistA, 1 ether);
+        _convert(keeper);
+        uint256 aShares = vault.benefactorShares(artistA);
+        vault.depositFees{ value: 1 ether }();
+
+        _contribute(artistB, 1 ether);
+        _convert(keeper);
+        _contribute(artistC, 1 ether);
+        _convert(keeper);
+
+        assertEq(vault.benefactorShares(artistA), aShares, "shares unchanged by later batches");
+        assertEq(vault.getBenefactorShares(artistA), aShares);
+        assertApproxEqAbs(vault.getUnclaimedFees(artistA), 1 ether, 2, "fees from before others joined are all A's");
+        assertEq(vault.getUnclaimedFees(artistB), 0, "B earned nothing before joining");
+
+        vm.prank(artistA);
+        assertApproxEqAbs(vault.claimFees(), 1 ether, 2);
+        vm.prank(artistA);
+        vm.expectRevert();
+        vault.claimFees();
+    }
+
+    /// Shares arrive only at the batch's close: fees booked while waiting belong to existing holders.
+    function test_pendingContributionEarnsNothingBeforeItsBatchCloses() public {
+        _contribute(artistA, 1 ether);
+        _convert(keeper);
+        _contribute(artistB, 1 ether);
+        vault.depositFees{ value: 1 ether }();
+        assertEq(vault.benefactorShares(artistB), 0);
+        _convert(keeper);
+        assertEq(vault.getUnclaimedFees(artistB), 0);
+        assertApproxEqAbs(vault.getUnclaimedFees(artistA), 1 ether, 2);
+    }
+
+    /// Contributing again collects the earlier batch first, without touching fees earned on it.
+    function test_contributingAgainCollectsTheEarlierBatch() public {
+        _contribute(artistA, 1 ether);
+        _convert(keeper);
+        uint256 first = vault.benefactorShares(artistA);
+        vault.depositFees{ value: 1 ether }();
+        _contribute(artistA, 1 ether);
+        assertEq(vault.benefactorShares(artistA), first, "pending ETH adds no shares yet");
+        assertEq(vault.pendingETH(artistA), 1 ether);
+        assertApproxEqAbs(vault.getUnclaimedFees(artistA), 1 ether, 2);
+        _convert(keeper);
+        assertGt(vault.benefactorShares(artistA), first);
+        assertApproxEqAbs(vault.getUnclaimedFees(artistA), 1 ether, 2, "still exactly the earlier fees");
+    }
+
+    function testFuzz_claimsNeverExceedFees(uint64[4] memory amounts, uint64 feeA, uint64 feeB) public {
+        address[4] memory who = [artistA, artistB, artistC, makeAddr("d")];
+        vm.deal(who[3], 1000 ether);
+        uint256 fees;
+        for (uint256 i; i < 4; ++i) {
+            _contribute(who[i], bound(amounts[i], vault.MIN_CONTRIBUTION(), 50 ether));
+            if (i % 2 == 1) {
+                _convert(keeper);
+                uint256 f = bound(i == 1 ? feeA : feeB, 1e6, 5 ether);
+                vault.depositFees{ value: f }();
+                fees += f;
+            }
+        }
+        uint256 paid;
+        for (uint256 i; i < 4; ++i) {
+            if (vault.getUnclaimedFees(who[i]) == 0) continue;
+            vm.prank(who[i]);
+            paid += vault.claimFees();
+        }
+        assertLe(paid, fees);
+        assertApproxEqAbs(paid, fees, 1e6, "only rounding is left");
+    }
+
+    function test_feeTokenFloorOfZeroLeavesThemPending() public {
+        _contribute(artistA, 1 ether);
+        _convert(keeper);
+        reg.setConversionKeeper(keeper);
+        _contribute(artistB, 1 ether);
+        vm.prank(keeper);
+        vault.convertAndAddLiquidity(1, 0);
+        assertEq(vault.closedBatches(), 2);
     }
 }

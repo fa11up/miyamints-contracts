@@ -79,8 +79,16 @@ contract EmptyPoolManager {
     }
 }
 
+contract MockWeth {
+    mapping(address => uint256) public balanceOf;
+
+    function set(address who, uint256 amount) external {
+        balanceOf[who] = amount;
+    }
+}
+
 contract UniswapVaultPriceValidatorTest is Test {
-    address constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address WETH;
     address constant TOKEN = 0x53d0eA0A685220718Dc6a0a6e4617194C6F37921;
 
     MockV2Factory v2;
@@ -88,6 +96,9 @@ contract UniswapVaultPriceValidatorTest is Test {
     UniswapVaultPriceValidator validator;
 
     function setUp() public {
+        // Below TOKEN's address sorting isn't what these tests vary: WETH sorts after the token, like INFER on mainnet.
+        WETH = address(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
+        vm.etch(WETH, address(new MockWeth()).code);
         v2 = new MockV2Factory();
         v3 = new MockV3Factory();
         validator = new UniswapVaultPriceValidator(WETH, address(v2), address(v3), address(new EmptyPoolManager()), 500, 1800);
@@ -97,7 +108,19 @@ contract UniswapVaultPriceValidatorTest is Test {
 
     /// Tick 69_000 is about 1 token = 1000 WETH, nowhere near the v2 reference.
     function _v3AtWrongPrice(uint128 liquidity) internal {
-        v3.set(3000, address(new MockV3Pool(TOKEN, WETH, liquidity, 69_000)));
+        _v3At(liquidity, 69_000, 100e18);
+    }
+
+    function _v3At(uint128 liquidity, int24 tick, uint256 wethHeld) internal {
+        address pool = address(new MockV3Pool(TOKEN, WETH, liquidity, tick));
+        MockWeth(WETH).set(pool, wethHeld);
+        v3.set(3000, pool);
+    }
+
+    /// Enough virtual depth from a one-tick position, but only dust of real WETH behind it.
+    function test_narrowPoolWithoutRealWethIsIgnored() public {
+        _v3At(1e30, 69_000, 1e15);
+        validator.validatePrice(TOKEN, 1 ether);
     }
 
     function test_dustV3PoolAtWrongPriceIsIgnored() public {
@@ -118,7 +141,7 @@ contract UniswapVaultPriceValidatorTest is Test {
 
     /// Above tick ~694_500 the old price formula overflowed. A deep pool passes the depth floor and reaches it.
     function test_extremeTickDoesNotPanic() public {
-        v3.set(3000, address(new MockV3Pool(TOKEN, WETH, 1e30, 800_000)));
+        _v3At(1e30, 800_000, 100e18);
         vm.expectRevert(UniswapVaultPriceValidator.PriceDeviationTooHigh.selector);
         validator.validatePrice(TOKEN, 1 ether);
     }

@@ -208,12 +208,12 @@ contract UniAlignmentVaultTest is Test {
         assertEq(vault.totalPendingETH(), 3 ether, "Total pending ETH should be 3 ether");
     }
 
-    function test_Receive_AddsToConversionParticipants() public {
+    function test_Receive_JoinsTheOpenBatch() public {
         vm.prank(alice);
         (bool success, ) = address(vault).call{value: 1 ether}("");
         assertTrue(success);
 
-        assertEq(vault.conversionParticipants(0), alice, "Alice should be first participant");
+        assertEq(vault.pendingETH(alice), 1 ether, "Alice is waiting for the next conversion");
     }
 
     function test_Receive_MultipleContributionsFromSameBenefactor() public {
@@ -301,7 +301,7 @@ contract UniAlignmentVaultTest is Test {
         assertEq(vault.totalPendingETH(), 6 ether);
     }
 
-    function test_MultipleBenefactors_AllAddedToConversionParticipants() public {
+    function test_MultipleBenefactors_AllJoinTheOpenBatch() public {
         vm.prank(alice);
         (bool s1, ) = address(vault).call{value: 1 ether}("");
         assertTrue(s1);
@@ -314,9 +314,9 @@ contract UniAlignmentVaultTest is Test {
         (bool s3, ) = address(vault).call{value: 3 ether}("");
         assertTrue(s3);
 
-        assertEq(vault.conversionParticipants(0), alice);
-        assertEq(vault.conversionParticipants(1), bob);
-        assertEq(vault.conversionParticipants(2), charlie);
+        assertGt(vault.pendingETH(alice), 0);
+        assertGt(vault.pendingETH(bob), 0);
+        assertEq(vault.pendingETH(charlie), 3 ether);
     }
 
     function test_MultipleBenefactors_MixedContributionMethods() public {
@@ -395,7 +395,7 @@ contract UniAlignmentVaultTest is Test {
         assertEq(vault.totalPendingETH(), 0, "Total pending ETH should be cleared");
     }
 
-    function test_ConvertAndAddLiquidity_ClearsConversionParticipants() public {
+    function test_ConvertAndAddLiquidity_ClosesTheBatch() public {
         vm.prank(alice);
         (bool s1, ) = address(vault).call{value: 10 ether}("");
         assertTrue(s1);
@@ -407,9 +407,9 @@ contract UniAlignmentVaultTest is Test {
         vm.prank(dave);
         vault.convertAndAddLiquidity(1, 1);
 
-        // Array should be empty - trying to access should revert
-        vm.expectRevert();
-        vault.conversionParticipants(0);
+        assertEq(vault.closedBatches(), 1);
+        assertEq(vault.pendingETH(alice), 0);
+        assertEq(vault.totalPendingETH(), 0);
     }
 
     function test_ConvertAndAddLiquidity_PaysCallerReward() public {

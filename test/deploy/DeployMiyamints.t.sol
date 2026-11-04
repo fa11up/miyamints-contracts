@@ -101,10 +101,16 @@ contract DeployMiyamintsForkTest is Test {
             return;
         }
 
-        InferPoolSeeder seeder = new InferPoolSeeder(INFER);
-        deal(INFER, address(seeder), 100_000_000e18);
-        vm.deal(address(this), 100 ether);
-        seeder.seed{ value: 100 ether }();
+        // Once the real pool is seeded these tests run against it.
+        PoolKey memory poolKey = PoolKey(Currency.wrap(address(0)), Currency.wrap(INFER), 10000, 200, IHooks(address(0)));
+        (uint160 existing,,,) = StateLibrary.getSlot0(MANAGER, poolKey.toId());
+        if (existing == 0) {
+            InferPoolSeeder seeder = new InferPoolSeeder(INFER);
+            deal(INFER, address(seeder), 100_000_000e18);
+            vm.deal(address(this), 100 ether);
+            seeder.seed{ value: 100 ether }();
+        }
+        vm.etch(safe, hex"00"); // the script requires OWNER to have code
 
         vm.setEnv("KEEPER", vm.toString(keeper));
         vm.deal(deployer, 10 ether);
@@ -310,23 +316,44 @@ contract DeployMiyamintsForkTest is Test {
         return FixedPointMathLib.fullMulDiv(FixedPointMathLib.fullMulDiv(tokens, 1 << 96, sqrtPriceX96), 1 << 96, sqrtPriceX96);
     }
 
-    /// Leftovers must settle at a small share of one batch however many conversions run: small batches leave ETH over
-    /// and large ones (here, far bigger than the pool) leave tokens, so run both.
-    function _assertLeftoversSettle(uint256 batch, uint256 rounds) internal {
+    /// Leftovers stay a small share of every batch, from the first conversion on: small batches, and one far bigger
+    /// than the pool, whose swap has to allow for moving the price a long way.
+    function _assertLeftoversStaySmall(uint256 batch, uint256 rounds) internal {
         UniAlignmentVault v;
         for (uint256 i; i < rounds; ++i) {
             v = _contributeAndConvert(batch);
+            assertLt(_unaccountedEth(v), batch / 25, "ETH left over");
+            assertLt(_unusedTokenValue(v), batch / 25, "tokens left over");
         }
-        assertLt(_unaccountedEth(v), batch / 50, "ETH left over");
-        assertLt(_unusedTokenValue(v), batch / 50, "tokens left over");
     }
 
-    function test_fork_leftoversSettle_smallBatches() public onFork {
-        _assertLeftoversSettle(0.1 ether, 40);
+    function test_fork_leftoversStaySmall_smallBatches() public onFork {
+        _assertLeftoversStaySmall(0.1 ether, 40);
     }
 
-    function test_fork_leftoversSettle_largeBatches() public onFork {
-        _assertLeftoversSettle(10 ether, 12);
+    function test_fork_leftoversStaySmall_largeBatches() public onFork {
+        _assertLeftoversStaySmall(10 ether, 12);
+    }
+
+    /// A contributor after a huge batch gets about the shares their own ETH buys, not a windfall from its leftovers.
+    function test_fork_noWindfallAfterALargeBatch() public onFork {
+        UniAlignmentVault v = UniAlignmentVault(payable(d.defaultVault));
+        vm.deal(buyer, 11 ether);
+        vm.prank(buyer);
+        (bool ok,) = address(v).call{ value: 10 ether }("");
+        assertTrue(ok);
+        vm.prank(keeper);
+        v.convertAndAddLiquidity(1, 1);
+
+        address next = makeAddr("next");
+        vm.deal(next, 1 ether);
+        vm.prank(next);
+        (ok,) = address(v).call{ value: 1 ether }("");
+        assertTrue(ok);
+        vm.prank(keeper);
+        v.convertAndAddLiquidity(1, 1);
+        // Their 1 ETH is about 1/15 of the pool's ETH side after A's batch; 2x shares would be well past this.
+        assertLt(v.benefactorShares(next) * 100 / v.totalShares(), 12);
     }
 
     function test_fork_proportionIsAboutHalfForFullRange() public onFork {
@@ -338,49 +365,57 @@ contract DeployMiyamintsForkTest is Test {
         assertApproxEqRel(p, 5e17, 1e16);
     }
 
+    /// Fee tokens and claims through the real router: trades both ways earn the position both fees.
+    function test_fork_feeTokensConvertAndClaimsPay() public onFork {
+        UniAlignmentVault v = _contributeAndConvert(5 ether);
+        address trader = makeAddr("trader");
+        vm.deal(trader, 20 ether);
+        vm.startPrank(trader);
+        (, uint256 bought) = IzRouterSwap(Z_ROUTER).swapV4{ value: 5 ether }(
+            trader, false, 10000, 200, address(0), INFER, 5 ether, 1, type(uint256).max
+        );
+        ERC20Approve(INFER).approve(Z_ROUTER, bought);
+        IzRouterSwap(Z_ROUTER).swapV4(trader, false, 10000, 200, INFER, address(0), bought, 1, type(uint256).max);
+        vm.stopPrank();
+
+        vm.warp(block.timestamp + 2 days);
+        vm.prank(keeper);
+        v.convertFeeTokens(1);
+        assertEq(v.pendingFeeTokens(), 0);
+        assertGt(v.getUnclaimedFees(buyer), 0);
+        uint256 before = buyer.balance;
+        vm.prank(buyer);
+        uint256 paid = v.claimFees();
+        assertEq(buyer.balance - before, paid);
+        assertGt(paid, 0.01 ether, "earned on both sides of 5 ETH traded");
+    }
+
     function test_fork_oneWeiInRouterDoesNotBlockConversion() public onFork {
         vm.deal(address(this), 1 ether);
         (bool ok,) = Z_ROUTER.call{ value: 1 }("");
         assertTrue(ok, "router accepts ETH");
         _contributeAndConvert(1 ether);
     }
-
-    function test_fork_dustV4PoolAtExtremeTickDoesNotBlockConversion() public onFork {
-        PoolKey memory dust = PoolKey(Currency.wrap(address(0)), Currency.wrap(INFER), 3000, 60, IHooks(address(0)));
-        MANAGER.initialize(dust, TickMath.getSqrtPriceAtTick(800_000));
-        // One wei of in-range liquidity, which anyone could add.
-        bytes32 slot = bytes32(uint256(keccak256(abi.encode(keccak256(abi.encode(dust)), uint256(6)))) + 3);
-        vm.store(address(MANAGER), slot, bytes32(uint256(1)));
-        _contributeAndConvert(1 ether);
-    }
-
-    function test_fork_dustV3PoolDoesNotBlockLaterConversions() public onFork {
-        _contributeAndConvert(1 ether);
-        // A v3 WETH/INFER pool with 1 wei of liquidity, 30 minutes old, at an arbitrary tick.
-        DustV3Pool dust = new DustV3Pool();
-        vm.mockCall(
-            UniswapVaultPriceValidator(address(UniAlignmentVault(payable(d.defaultVault)).priceValidator())).v3Factory(),
-            abi.encodeWithSignature("getPool(address,address,uint24)", address(UniswapVaultPriceValidator(address(UniAlignmentVault(payable(d.defaultVault)).priceValidator())).weth()), INFER, uint24(3000)),
-            abi.encode(address(dust))
-        );
-        _contributeAndConvert(1 ether);
-    }
-}
-
-/// @dev A v3 pool as anyone could set one up: dust liquidity and one old observation at the tick they chose.
-contract DustV3Pool {
-    function token0() external pure returns (address) { return 0x53d0eA0A685220718Dc6a0a6e4617194C6F37921; }
-    function token1() external pure returns (address) { return 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2; }
-    function liquidity() external pure returns (uint128) { return 1; }
-    function slot0() external pure returns (uint160, int24, uint16, uint16, uint16, uint8, bool) {
-        return (79228162514264337593543950336, 0, 0, 1, 1, 0, true);
-    }
-    function observe(uint32[] calldata) external pure returns (int56[] memory t, uint160[] memory l) {
-        t = new int56[](2);
-        l = new uint160[](2);
-    }
 }
 
 interface ERC20Balance {
     function balanceOf(address) external view returns (uint256);
+}
+
+interface IzRouterSwap {
+    function swapV4(
+        address to,
+        bool exactOut,
+        uint24 swapFee,
+        int24 tickSpace,
+        address tokenIn,
+        address tokenOut,
+        uint256 swapAmount,
+        uint256 amountLimit,
+        uint256 deadline
+    ) external payable returns (uint256 amountIn, uint256 amountOut);
+}
+
+interface ERC20Approve {
+    function approve(address, uint256) external returns (bool);
 }

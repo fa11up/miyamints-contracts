@@ -7,6 +7,7 @@ import { Ownable } from "solady/auth/Ownable.sol";
 import { LibString } from "solady/utils/LibString.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { StateLibrary } from "v4-core/libraries/StateLibrary.sol";
+import { FullMath } from "v4-core/libraries/FullMath.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
 import { PoolId, PoolIdLibrary } from "v4-core/types/PoolId.sol";
 import { Currency } from "v4-core/types/Currency.sol";
@@ -69,6 +70,7 @@ contract DeployMiyamints is Script {
         uint16 protocolFeeBps;
         uint16 minAlignmentBps;
         uint256 maxPriceDeviationBps;
+        uint256 minPoolEth; // wei of virtual ETH depth the alignment pool must have
         uint32 twapSeconds;
         string alignmentTargetName;
         address alignmentToken;
@@ -156,6 +158,7 @@ contract DeployMiyamints is Script {
         c.minAlignmentBps = uint16(vm.envOr("MIN_ALIGNMENT_BPS", vm.parseJsonUint(json, ".minAlignmentBps")));
         c.maxPriceDeviationBps = vm.parseJsonUint(json, ".maxPriceDeviationBps");
         c.twapSeconds = uint32(vm.parseJsonUint(json, ".twapSeconds"));
+        c.minPoolEth = vm.envOr("MIN_POOL_ETH", vm.parseJsonUint(json, ".minPoolEth"));
         c.alignmentTargetName = vm.envOr("ALIGNMENT_TARGET_NAME", vm.parseJsonString(json, ".alignmentTargetName"));
         c.alignmentToken = vm.envOr("ALIGNMENT_TOKEN", vm.parseJsonAddress(json, ".alignmentToken"));
         c.keeper = vm.envOr("KEEPER", address(0));
@@ -188,6 +191,11 @@ contract DeployMiyamints is Script {
         d.deployer = deployer;
         if (c.owner == address(0)) c.owner = deployer;
         if (c.treasury == address(0)) c.treasury = deployer; // testnet only (loadConfig enforces)
+        // Ownership moves in one step and the treasury is fixed in every collection, so neither can be a dead address.
+        if (block.chainid == 1 || block.chainid == 4663) {
+            if (c.owner != deployer) _requireCode(c.owner, "OWNER");
+            _requireCode(c.treasury, "TREASURY");
+        }
 
         // 0. Testnet alignment token.
         d.alignmentToken = c.alignmentToken;
@@ -460,9 +468,13 @@ contract DeployMiyamints is Script {
         PoolId id = key.toId();
         (uint160 sqrtPriceX96,,,) = IPoolManager(c.poolManager).getSlot0(id);
         if (sqrtPriceX96 == 0) revert ConfigError("no hookless native-ETH v4 pool for alignmentToken at zRouterFee");
-        if (IPoolManager(c.poolManager).getLiquidity(id) == 0) {
-            revert ConfigError("alignmentToken v4 pool at zRouterFee has zero in-range liquidity");
-        }
+        uint128 liquidity = IPoolManager(c.poolManager).getLiquidity(id);
+        // Anyone can initialize an unseeded pool at any price. This is depth at the current price, which a narrow position
+        // reaches cheaply, so it only stops an unseeded or dust pool. Print what a human has to compare against the market.
+        uint256 virtualEth = FullMath.mulDiv(liquidity, 1 << 96, sqrtPriceX96);
+        if (virtualEth < c.minPoolEth) revert ConfigError("alignmentToken v4 pool is shallower than minPoolEth");
+        console2.log("alignment pool: virtual ETH (wei)", virtualEth);
+        console2.log("alignment pool: sqrtPriceX96; compare with the market before you broadcast", uint256(sqrtPriceX96));
     }
 
     function _requireCode(address a, string memory what) internal view {

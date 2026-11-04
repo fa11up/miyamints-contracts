@@ -516,11 +516,8 @@ contract ERC1155Instance is Ownable, ReentrancyGuard, IInstanceLifecycle {
      * @dev Only callable by the project creator
      *      This instance was registered as the benefactor when tithes were sent to the vault
      *      The creator calls this to claim fees and keep the rewards
-     * @dev Fee claiming uses intentional "dragnet" pattern. Vault contributions
-     *      (via withdraw tithe) go to pendingETH and only convert to benefactorShares
-     *      when convertAndAddLiquidity() is called. Creators must wait for conversion
-     *      before claiming fees. Frontend handles dragnet activation to ensure
-     *      contributions are included in conversions.
+     * @dev Vault contributions (via withdraw) wait in the vault's open batch and earn shares when the keeper next
+     *      converts. Fees can only be claimed after that.
      * @return totalClaimed Amount of ETH claimed from vault
      */
     function claimVaultFees() external onlyOwner nonReentrant returns (uint256 totalClaimed) {

@@ -180,13 +180,21 @@ contract UniAlignmentVaultRealV4Test is Test {
         assertGe(token.balanceOf(address(vault)), pending, "and are still held");
     }
 
+    /// The keeper's floor covers the tokens bought across every pass.
+    function test_floorCoversAllPasses() public {
+        _contribute(alice, 2 ether);
+        vm.expectRevert(UniAlignmentVault.InsufficientOutput.selector);
+        vault.convertAndAddLiquidity(type(uint128).max, 1);
+    }
+
     function test_keeperConvertsFeeTokensAndCreditsHolders() public {
         _contribute(alice, 2 ether);
         vault.convertAndAddLiquidity(1, 1);
         _trade(3);
 
-        vm.expectRevert(UniAlignmentVault.AmountMustBePositive.selector);
+        // A floor of 0 leaves them pending, so tokens worth under 1 wei can't block the keeper.
         vault.convertFeeTokens(0);
+        assertGt(vault.pendingFeeTokens(), 0, "collected and left pending");
 
         uint256 before = vault.getUnclaimedFees(alice);
         vault.convertFeeTokens(1);

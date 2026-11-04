@@ -100,10 +100,9 @@ Fixed, with regression tests. The vault findings were reproduced on a mainnet fo
 - **zRouter refund blocked conversions** (High): zRouter refunds its whole ETH balance to the payer after an ETH swap, so
   1 wei sent to the router made `receive()` revert every conversion. The swap now runs in collecting mode.
 - **Leftovers** (Low): an LP add can't use every wei, and fees earned by the position net off what it pays in. Each
-  conversion now works from all the ETH and tokens the vault holds beyond what it owes, sizing the swap to count tokens
-  already held, so leftovers feed into the next batch and stay under 2% of a batch in the fork tests (40 small and 8
-  large batches). That batch gets a small windfall in LP shares, which can only earn yield. ETH sent to the vault
-  outside contributions ends up here too. Some leftover always remains in the vault until the next conversion.
+  conversion works from all the ETH and tokens the vault holds beyond what it owes, so leftovers feed the next batch,
+  which gets them as a small windfall in LP shares (those can only earn yield). ETH sent to the vault outside
+  contributions ends up here too.
 - **Price overflow, dust reference pools, TWAP orientation** (High x3): prices use `fullMulDiv`. A v3 or v4 pool only
   counts as a reference with at least 10 ETH of virtual depth at its current price. `calculateSwapProportion` no longer
   compares against a TWAP, which removes both the griefing path and the inverted comparison. `validatePrice` now only
@@ -130,13 +129,10 @@ Accepted or deferred:
 - **Gating module**: it gates nothing even if configured: the no-password tier is open, and the "password" is a public
   hash. `FREE_MINT_ONLY` and `claimFreeMint` bugs are latent behind it. It stays off at deploy and needs a redesign
   before it is enabled.
-- **The depth floor measures virtual depth, not capital.** A narrow v3 position can meet it cheaply at a fake price. To
-  block anything, that also needs a v2 pair holding 10+ WETH of the griefer's own to disagree with. INFER has neither,
-  and a keeper can reset it by swapping the pool out of range.
+- **Griefing a reference pool needs real capital, not none.** A griefer who keeps 10 WETH (recoverable) in a v3 pool at a
+  wrong price can block a token that also has a 10+ WETH v2 pair. INFER has neither.
 - **1155 `withdraw(amount)` can be front-run** now that anyone can call it: the artist's exact-amount transaction reverts,
   a retry works, and no funds are at risk.
-- **500-participant cap griefing**: 500 small contributions can delay other collections' cuts (parked, not lost) until the
-  keeper converts. The keeper has to run a costly conversion, and the griefer's ETH becomes LP shares.
 - **Auction anti-snipe has no cap**: a high bidder can keep a line open by paying the increment and gas every window.
   Anyone can outbid. Creators choose the increment.
 - **Info items left as they are**: a committer's own same-transaction deposits count toward its draw range; re-arming an
@@ -145,9 +141,37 @@ Accepted or deferred:
   can't be pooled; the registry owner can lower the alignment floor for future launches only; `DynamicPricingModule` is
   accepted as a gating module; 1155 mints skip the receiver hook.
 
+## Final review round (deployment and fixes, at 7906d3d)
+
+Fixed:
+
+- **Batch size could freeze a vault** (High): a conversion looped over every contributor, and 500 fresh ones needed more
+  than mainnet's transaction gas cap. It now records one share rate per batch and each benefactor collects theirs the
+  next time they are touched (`_collected`, `_settleFees`), so a conversion costs the same for any number of
+  contributors. The participant cap and the griefing around it are gone, along with dust share bookkeeping: shares
+  round down when collected, so a few wei of `totalShares` belong to nobody and their fee share stays in the vault.
+  `benefactorShares` and `pendingETH` are now views that include an uncollected batch.
+- **Dust fee tokens blocked the keeper** (Medium): a floor of 0 now leaves fee tokens pending. A keeper could use this to
+  skip real fee tokens before a share change, moving some yield to new holders: part of keeper trust below.
+- **Next contributor's windfall** (Medium): the swap uses the single-sided add formula against the pool's virtual ETH
+  depth, then measures what is left and goes again, up to three passes (`_swapAndAdd`), so a batch pairs its own ETH even
+  when liquidity outside the current range absorbs the swap at a better price than the formula assumes. Leftovers feed
+  the next batch. Accepted edge: on a batch far larger than the pool, a position tuned to the batch can still make a later
+  pass over-swap and leave tokens for the next batch. On a harness with a 100 ETH batch against 4.87 ETH of depth, the
+  next 30 ETH contributor got 29% of shares where 15% is normal, and the position's owner about 0.8 ETH; at 10 ETH the
+  worst tried left 1.5% of the batch. Principal stays in the LP. The keeper must simulate each conversion, and convert
+  often enough that batches stay small against the pool.
+- **Depth floor** (Low): a v3 reference must also hold 10 WETH, so a one-tick position can't pass it with dust.
+- **Deploy script** (Low): `OWNER` and mainnet or 4663 `TREASURY` must have code; the alignment pool must have
+  `minPoolEth` of depth at its current price (a narrow position reaches that cheaply, so it only stops an unseeded or dust
+  pool), and the script prints depth and price for a human to check. `DEPLOY.md` gives a seeding procedure.
+- **Fork tests** (Low, Info): they use the real pool once it exists, and now convert fee tokens and claim through the real
+  zRouter. Two regressions that could no longer fail were removed; unit tests cover what they claimed.
+
 ## Notes for the reviewer
 
-- **Keeper trust (M2).** The keeper's floors are the only price protection. A malicious keeper, or whoever holds its
+- **Keeper trust (M2).** The keeper must simulate each conversion: swap size depends on the pool's state, and `minOutTarget`
+  is the tokens bought across all passes. The keeper's floors are the only price protection. A malicious keeper, or whoever holds its
   key, can sandwich its own conversion with low floors and take up to the whole batch being converted. It can also stop
   converting (ETH and fee tokens wait; the owner can replace it). It cannot touch earlier LP positions or settled fees.
 - **`validatePrice` is a backstop, not a guarantee.** It cross-checks v2 against v3 only when both have real depth. INFER

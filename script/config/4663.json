@@ -15,6 +15,7 @@
   "protocolFeeBps": 100,
   "minAlignmentBps": 1000,
   "maxPriceDeviationBps": 500,
+  "minPoolEth": 1000000000000000000,
   "twapSeconds": 1800,
   "alignmentTargetName": "USDG (placeholder)",
   "alignmentToken": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",

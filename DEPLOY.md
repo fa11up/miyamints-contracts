@@ -70,8 +70,11 @@ produced identical addresses). Re-running with the same deployer and namespace r
 **Robinhood Chain: don't offer RANDOM pools.** `blockhash` on Arbitrum-based chains is documented as insecure randomness
 (AUDIT-NOTES.md). They need a different randomness source, or must stay off, before any launch there.
 
-**Seed the alignment pool deep enough for your batches.** A conversion much larger than the pool moves its price a long
-way: the fork test with a thin pool left about half a 10 ETH batch unused on the first conversion (later ones use it).
+**Seed the alignment pool in one transaction, then check it.** `PoolManager.initialize` is open to anyone, so an unseeded
+pool can be initialized first at any price. Initialize and add liquidity atomically (one call through a position manager
+or your own contract), with a price limit. If someone got there first, trade the pool to the market price before adding
+anything. Seed it deep against your conversion batches. The script stops below `minPoolEth` of depth and prints the
+pool's depth and price: compare the price with the market before you broadcast, because no check here can know it.
 
 1. **Prepare.** `git submodule update --init --recursive`; `forge test` (the fork test runs the script on a
    mainnet fork and smoke-tests every factory). Create a fresh deployer and import it into a keystore:
