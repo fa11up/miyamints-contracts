@@ -101,6 +101,10 @@ contract ERC721DropTest is Test {
         return a < b ? keccak256(abi.encode(a, b)) : keccak256(abi.encode(b, a));
     }
 
+    /// @dev Read by `_params` and `_drop`; set these before `_drop` to vary them.
+    uint32 reserve;
+    uint32 phaseZeroCap;
+
     function _params(ERC721DropInstance.Phase[] memory phases, uint32 maxSupply)
         internal
         view
@@ -109,6 +113,7 @@ contract ERC721DropTest is Test {
         p.name = "miyamaker";
         p.symbol = "MIYA";
         p.maxSupply = maxSupply;
+        p.ownerReserve = reserve;
         p.unrevealedURI = "ar://unrevealed.json";
         p.contractURI = "ar://contract.json";
         p.royaltyReceiver = artist;
@@ -124,14 +129,16 @@ contract ERC721DropTest is Test {
             end: uint64(block.timestamp + 1 days),
             price: 0.03 ether,
             maxPerWallet: 2,
-            merkleRoot: _pair(_leaf(alice), _leaf(bob))
+            merkleRoot: _pair(_leaf(alice), _leaf(bob)),
+            supplyCap: phaseZeroCap
         });
         phases[1] = ERC721DropInstance.Phase({
             start: uint64(block.timestamp + 1 days),
             end: 0,
             price: PRICE,
             maxPerWallet: 0,
-            merkleRoot: bytes32(0)
+            merkleRoot: bytes32(0),
+            supplyCap: 0
         });
         vm.prank(artist);
         d = ERC721DropInstance(payable(factory.createDrop(_params(phases, maxSupply), address(vault), alignmentBps)));
@@ -261,13 +268,14 @@ contract ERC721DropTest is Test {
         d.mint(1, 0, _noProof());
     }
 
-    function test_ownerMintCountsTowardSupply() public {
+    function test_ownerMintLimitedToReserve() public {
+        reserve = 5;
         ERC721DropInstance d = _drop(5, 1000);
         vm.prank(artist);
         d.ownerMint(bob, 4);
         assertEq(d.balanceOf(bob), 4);
         vm.prank(artist);
-        vm.expectRevert(ERC721DropInstance.SoldOut.selector);
+        vm.expectRevert(ERC721DropInstance.ReserveExceeded.selector);
         d.ownerMint(bob, 2);
         vm.prank(alice);
         vm.expectRevert();
@@ -330,6 +338,7 @@ contract ERC721DropTest is Test {
     // ── metadata ─────────────────────────────────────────────────────────────
 
     function test_revealAndLock() public {
+        reserve = 1;
         ERC721DropInstance d = _drop(100, 1000);
         vm.prank(artist);
         d.ownerMint(alice, 1);
@@ -376,7 +385,8 @@ contract ERC721DropTest is Test {
             end: 0,
             price: PRICE,
             maxPerWallet: 1,
-            merkleRoot: bytes32(0)
+            merkleRoot: bytes32(0),
+            supplyCap: 0
         });
         vm.prank(artist);
         d.setPhases(next);
@@ -400,7 +410,7 @@ contract ERC721DropTest is Test {
     function test_setPhasesValidation() public {
         ERC721DropInstance d = _drop(100, 1000);
         ERC721DropInstance.Phase[] memory bad = new ERC721DropInstance.Phase[](1);
-        bad[0] = ERC721DropInstance.Phase(100, 50, 1, 0, bytes32(0));
+        bad[0] = ERC721DropInstance.Phase(100, 50, 1, 0, bytes32(0), 0);
         vm.prank(artist);
         vm.expectRevert(ERC721DropInstance.InvalidParams.selector);
         d.setPhases(bad);
@@ -409,6 +419,205 @@ contract ERC721DropTest is Test {
         vm.prank(artist);
         vm.expectRevert(ERC721DropInstance.InvalidParams.selector);
         d.setPhases(tooMany);
+    }
+
+    // ── owner reserve ────────────────────────────────────────────────────────
+
+    function _openPublic() internal {
+        vm.warp(block.timestamp + 1 days);
+        vm.deal(carol, 1000 ether);
+    }
+
+    function test_noReserveMeansNoOwnerMint() public {
+        ERC721DropInstance d = _drop(100, 1000);
+        vm.prank(artist);
+        vm.expectRevert(ERC721DropInstance.ReserveExceeded.selector);
+        d.ownerMint(bob, 1);
+    }
+
+    function test_reserveAboveSupplyRejected() public {
+        reserve = 11;
+        ERC721DropInstance.Phase[] memory none;
+        vm.prank(artist);
+        vm.expectRevert(ERC721DropInstance.InvalidParams.selector);
+        factory.createDrop(_params(none, 10), address(vault), 1000);
+    }
+
+    function test_phasesCannotSellTheReserve() public {
+        reserve = 3;
+        ERC721DropInstance d = _drop(10, 1000);
+        _openPublic();
+        assertEq(d.publicRemaining(), 7);
+        vm.startPrank(carol);
+        vm.expectRevert(ERC721DropInstance.SoldOut.selector);
+        d.mint{ value: PRICE * 8 }(1, 8, new bytes32[](0));
+        d.mint{ value: PRICE * 7 }(1, 7, new bytes32[](0));
+        vm.expectRevert(ERC721DropInstance.SoldOut.selector);
+        d.mint{ value: PRICE }(1, 1, new bytes32[](0));
+        vm.stopPrank();
+        assertEq(d.publicRemaining(), 0);
+
+        vm.prank(artist);
+        d.ownerMint(bob, 3);
+        assertEq(d.totalSupply(), 10);
+        assertEq(d.publicRemaining(), 0);
+        vm.prank(artist);
+        vm.expectRevert(ERC721DropInstance.ReserveExceeded.selector);
+        d.ownerMint(bob, 1);
+    }
+
+    function test_ownerMintDoesNotShrinkPublicSupply() public {
+        reserve = 3;
+        ERC721DropInstance d = _drop(10, 1000);
+        vm.prank(artist);
+        d.ownerMint(bob, 2);
+        assertEq(d.publicRemaining(), 7);
+        _openPublic();
+        vm.prank(carol);
+        d.mint{ value: PRICE * 7 }(1, 7, new bytes32[](0));
+        assertEq(d.totalSupply(), 9);
+    }
+
+    function testFuzz_reserveAlwaysClaimable(uint32 supply, uint32 reserve_, uint32 sold, uint32 ownerFirst) public {
+        supply = uint32(bound(supply, 1, 200));
+        reserve = uint32(bound(reserve_, 0, supply));
+        ERC721DropInstance d = _drop(supply, 1000);
+        uint256 first = bound(ownerFirst, 0, reserve);
+        if (first != 0) {
+            vm.prank(artist);
+            d.ownerMint(bob, first);
+        }
+        _openPublic();
+        uint256 want = bound(sold, 1, supply);
+        uint256 room = supply - reserve;
+        vm.prank(carol);
+        if (want > room) vm.expectRevert(ERC721DropInstance.SoldOut.selector);
+        d.mint{ value: PRICE * want }(1, want, new bytes32[](0));
+        uint256 publicSold = want > room ? 0 : want;
+        assertEq(d.publicRemaining(), room - publicSold);
+        if (reserve > first) {
+            vm.prank(artist);
+            d.ownerMint(bob, reserve - first);
+        }
+        assertEq(d.totalSupply(), publicSold + reserve);
+        assertLe(d.totalSupply(), supply);
+    }
+
+    // ── phase supply cap ─────────────────────────────────────────────────────
+
+    function test_phaseCapStopsThatPhaseOnly() public {
+        phaseZeroCap = 3;
+        ERC721DropInstance d = _drop(100, 1000);
+        bytes32[] memory aliceProof = new bytes32[](1);
+        aliceProof[0] = _leaf(bob);
+        bytes32[] memory bobProof = new bytes32[](1);
+        bobProof[0] = _leaf(alice);
+        vm.prank(alice);
+        d.mint{ value: 0.06 ether }(0, 2, aliceProof);
+        vm.prank(bob);
+        vm.expectRevert(ERC721DropInstance.PhaseSoldOut.selector);
+        d.mint{ value: 0.06 ether }(0, 2, bobProof);
+        vm.prank(bob);
+        d.mint{ value: 0.03 ether }(0, 1, bobProof);
+        assertEq(d.phasesMinted()[0], 3);
+
+        _openPublic();
+        vm.prank(carol);
+        d.mint{ value: PRICE * 5 }(1, 5, new bytes32[](0));
+        assertEq(d.phasesMinted()[1], 5);
+    }
+
+    function test_phaseCountsResetWithNewPhaseList() public {
+        phaseZeroCap = 2;
+        ERC721DropInstance d = _drop(100, 1000);
+        bytes32[] memory proof = new bytes32[](1);
+        proof[0] = _leaf(bob);
+        vm.prank(alice);
+        d.mint{ value: 0.06 ether }(0, 2, proof);
+
+        ERC721DropInstance.Phase[] memory next = new ERC721DropInstance.Phase[](1);
+        next[0] = ERC721DropInstance.Phase(uint64(block.timestamp), 0, 0, 0, bytes32(0), 1);
+        vm.prank(artist);
+        d.setPhases(next);
+        assertEq(d.phasesMinted().length, 1);
+        assertEq(d.phasesMinted()[0], 0);
+        vm.prank(carol);
+        d.mint(0, 1, new bytes32[](0));
+        vm.prank(carol);
+        vm.expectRevert(ERC721DropInstance.PhaseSoldOut.selector);
+        d.mint(0, 1, new bytes32[](0));
+    }
+
+    // ── mintTo ───────────────────────────────────────────────────────────────
+
+    function test_mintToSendsToRecipientAndChargesPayerLimits() public {
+        ERC721DropInstance d = _drop(100, 1000);
+        bytes32[] memory proof = new bytes32[](1);
+        proof[0] = _leaf(bob);
+        vm.startPrank(alice);
+        d.mintTo{ value: 0.06 ether }(carol, 0, 2, proof);
+        assertEq(d.balanceOf(carol), 2);
+        assertEq(d.balanceOf(alice), 0);
+        assertEq(d.mintedInPhase(0, alice), 2);
+        assertEq(d.mintedInPhase(0, carol), 0);
+        // The wallet limit follows the payer, so a new recipient does not reset it.
+        vm.expectRevert(ERC721DropInstance.WalletLimit.selector);
+        d.mintTo{ value: 0.03 ether }(makeAddr("dave"), 0, 1, proof);
+        vm.stopPrank();
+    }
+
+    function test_mintToChecksAllowlistOnPayerNotRecipient() public {
+        ERC721DropInstance d = _drop(100, 1000);
+        bytes32[] memory proof = new bytes32[](1);
+        proof[0] = _leaf(alice);
+        vm.deal(carol, 1 ether);
+        vm.prank(carol);
+        vm.expectRevert(ERC721DropInstance.NotAllowlisted.selector);
+        d.mintTo{ value: 0.03 ether }(bob, 0, 1, proof);
+    }
+
+    function test_mintToZeroAddressReverts() public {
+        ERC721DropInstance d = _drop(100, 1000);
+        bytes32[] memory proof = new bytes32[](1);
+        proof[0] = _leaf(bob);
+        vm.prank(alice);
+        vm.expectRevert();
+        d.mintTo{ value: 0.03 ether }(address(0), 0, 1, proof);
+        assertEq(d.totalSupply(), 0);
+        assertEq(d.mintedInPhase(0, alice), 0);
+    }
+
+    // ── metadata events and royalty lock ─────────────────────────────────────
+
+    event BatchMetadataUpdate(uint256 _fromTokenId, uint256 _toTokenId);
+
+    function test_setMetadataEmitsEip4906() public {
+        ERC721DropInstance d = _drop(100, 1000);
+        assertTrue(d.supportsInterface(0x49064906));
+        vm.expectEmit(address(d));
+        emit BatchMetadataUpdate(1, 100);
+        vm.prank(artist);
+        d.setMetadata("ar://revealed/", "", "");
+    }
+
+    function test_royaltyLockIsPermanentAndOwnerOnly() public {
+        ERC721DropInstance d = _drop(100, 1000);
+        vm.prank(alice);
+        vm.expectRevert();
+        d.lockRoyalty();
+
+        vm.prank(artist);
+        d.setRoyalty(bob, 100);
+        vm.prank(artist);
+        d.lockRoyalty();
+        assertTrue(d.royaltyLocked());
+
+        vm.prank(artist);
+        vm.expectRevert(ERC721DropInstance.Locked.selector);
+        d.setRoyalty(artist, 1000);
+        (address to, uint256 amount) = d.royaltyInfo(1, 10_000);
+        assertEq(to, bob);
+        assertEq(amount, 100);
     }
 
     function testFuzz_splitConservesValue(uint96 paid, uint16 alignmentBps) public {

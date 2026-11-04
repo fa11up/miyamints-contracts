@@ -72,6 +72,23 @@ and swapped fee tokens with a zero floor when the validator had no price, so tok
 `pendingFeeTokens`. They convert before any share mint, which keeps H2's guarantee. Tests:
 `UniAlignmentVaultRealV4.t.sol`.
 
+## Drop additions after the internal audit
+
+These were added after the findings above, so the internal audit did not cover them. Tests:
+`test/factories/erc721drop/ERC721Drop.t.sol`.
+
+- **`ownerReserve`** (`InitParams`, immutable): `ownerMint` can mint only this many pieces in total, and phases can't
+  sell the unused part, so `totalSupply + (ownerReserve - ownerMinted) <= maxSupply` always holds. It limits
+  `ownerMint` only: the owner can still add a free phase with `setPhases`, as before.
+- **`Phase.supplyCap`**: the most a phase can sell; 0 = no cap. Counts are scoped to the phase list, so `setPhases`
+  resets them, including when it resubmits the same list. A cap therefore binds the owner only while the list stands;
+  `maxSupply` and the reserve always hold.
+- **`mintTo`**: mints to another wallet. The allowlist and per-wallet limit apply to the payer, not the recipient. It
+  uses `_mint`, so the recipient gets no callback.
+- **`lockRoyalty`**: permanently stops `setRoyalty`. Drops only: Auction and 1155 instances have no ERC-2981 support.
+- **Metadata events**: `setMetadata` emits EIP-4906 `BatchMetadataUpdate(1, maxSupply)` and `supportsInterface` reports
+  `0x49064906`. `ERC1155Instance.updateEditionMetadata` emits the standard `URI` event.
+
 ## Notes for the reviewer
 
 - **Keeper trust (M2).** A wrong or malicious keeper can pass low floors and lose value on conversions, or stop

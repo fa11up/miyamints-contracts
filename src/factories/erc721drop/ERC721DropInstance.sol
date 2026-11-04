@@ -33,12 +33,14 @@ contract ERC721DropInstance is ERC721, ERC2981, Ownable, ReentrancyGuard {
         uint128 price; // wei per token
         uint32 maxPerWallet; // 0 = unlimited
         bytes32 merkleRoot; // 0 = public; else leaf = keccak256(bytes.concat(keccak256(abi.encode(minter))))
+        uint32 supplyCap; // most this phase can sell in total; 0 = no cap beyond maxSupply
     }
 
     struct InitParams {
         string name;
         string symbol;
         uint32 maxSupply;
+        uint32 ownerReserve; // pieces only ownerMint can mint, held back from every phase; fixed at creation
         string baseURI; // revealed metadata prefix; empty until reveal
         string unrevealedURI; // served for every token until reveal
         string contractURI;
@@ -55,6 +57,7 @@ contract ERC721DropInstance is ERC721, ERC2981, Ownable, ReentrancyGuard {
     uint16 public immutable protocolBps;
     uint16 public immutable alignmentBps;
     uint32 public immutable maxSupply;
+    uint32 public immutable ownerReserve;
 
     string internal _name;
     string internal _symbol;
@@ -62,19 +65,26 @@ contract ERC721DropInstance is ERC721, ERC2981, Ownable, ReentrancyGuard {
     string public unrevealedURI;
     string public contractURI;
     bool public metadataLocked;
+    bool public royaltyLocked;
 
     Phase[] internal _phases;
     /// @dev Bumped by every setPhases so per-wallet counters never carry over to a different phase list.
     uint256 public phasesEpoch;
     mapping(uint256 epoch => mapping(uint256 phaseId => mapping(address minter => uint256))) internal _minted;
 
+    /// @dev Total sold per phase, scoped to the phase list like `_minted`.
+    mapping(uint256 epoch => mapping(uint256 phaseId => uint256)) internal _phaseMinted;
     uint256 public totalSupply;
+    uint256 public ownerMinted;
     uint256 public pendingVaultCut;
 
     event PhasesSet(Phase[] phases);
     event Minted(address indexed to, uint256 indexed phaseId, uint256 firstId, uint256 quantity, uint256 paid);
     event MetadataUpdated(string baseURI, string unrevealedURI, string contractURI);
     event MetadataLocked();
+    /// @dev EIP-4906: tells marketplaces to refresh every token's metadata.
+    event BatchMetadataUpdate(uint256 _fromTokenId, uint256 _toTokenId);
+    event RoyaltyLocked();
     event Withdrawn(uint256 toOwner, uint256 toVault, uint256 toProtocol);
     event VaultContributionFailed(uint256 amount);
 
@@ -83,6 +93,8 @@ contract ERC721DropInstance is ERC721, ERC2981, Ownable, ReentrancyGuard {
     error NotAllowlisted();
     error WalletLimit();
     error SoldOut();
+    error PhaseSoldOut();
+    error ReserveExceeded();
     error WrongPayment();
     error Locked();
     error NothingToWithdraw();
@@ -100,6 +112,7 @@ contract ERC721DropInstance is ERC721, ERC2981, Ownable, ReentrancyGuard {
         if (p.maxSupply == 0 || bytes(p.name).length == 0 || bytes(p.symbol).length == 0) revert InvalidParams();
         if (owner_ == address(0) || treasury_ == address(0) || vault_ == address(0)) revert InvalidParams();
         if (uint256(protocolBps_) + alignmentBps_ > RevenueSplitLib.BPS) revert InvalidParams();
+        if (p.ownerReserve > p.maxSupply) revert InvalidParams();
         _initializeOwner(owner_);
         treasury = treasury_;
         vault = IAlignmentVault(payable(vault_));
@@ -107,6 +120,7 @@ contract ERC721DropInstance is ERC721, ERC2981, Ownable, ReentrancyGuard {
         protocolBps = protocolBps_;
         alignmentBps = alignmentBps_;
         maxSupply = p.maxSupply;
+        ownerReserve = p.ownerReserve;
         _name = p.name;
         _symbol = p.symbol;
         baseURI = p.baseURI;
@@ -147,6 +161,19 @@ contract ERC721DropInstance is ERC721, ERC2981, Ownable, ReentrancyGuard {
         return _minted[phasesEpoch][phaseId][minter];
     }
 
+    /// @notice Sold so far in each phase of the current list (same order as `phases`).
+    function phasesMinted() external view returns (uint256[] memory minted) {
+        minted = new uint256[](_phases.length);
+        for (uint256 i; i < minted.length; ++i) {
+            minted[i] = _phaseMinted[phasesEpoch][i];
+        }
+    }
+
+    /// @notice Pieces phases can still sell: what is left of maxSupply after the unused owner reserve.
+    function publicRemaining() external view returns (uint256) {
+        return maxSupply - totalSupply - (ownerReserve - ownerMinted);
+    }
+
     function isPhaseActive(uint256 phaseId) public view returns (bool) {
         if (phaseId >= _phases.length) return false;
         Phase memory ph = _phases[phaseId];
@@ -154,7 +181,7 @@ contract ERC721DropInstance is ERC721, ERC2981, Ownable, ReentrancyGuard {
     }
 
     function supportsInterface(bytes4 id) public view override(ERC721, ERC2981) returns (bool) {
-        return ERC721.supportsInterface(id) || ERC2981.supportsInterface(id);
+        return ERC721.supportsInterface(id) || ERC2981.supportsInterface(id) || id == 0x49064906; // EIP-4906
     }
 
     // ┌─────────────────────────┐
@@ -162,6 +189,19 @@ contract ERC721DropInstance is ERC721, ERC2981, Ownable, ReentrancyGuard {
     // └─────────────────────────┘
 
     function mint(uint256 phaseId, uint256 quantity, bytes32[] calldata proof) external payable nonReentrant {
+        _mintInPhase(msg.sender, phaseId, quantity, proof);
+    }
+
+    /// @notice Mint to another wallet. The allowlist and per-wallet limit apply to the payer, not `to`.
+    function mintTo(address to, uint256 phaseId, uint256 quantity, bytes32[] calldata proof)
+        external
+        payable
+        nonReentrant
+    {
+        _mintInPhase(to, phaseId, quantity, proof);
+    }
+
+    function _mintInPhase(address to, uint256 phaseId, uint256 quantity, bytes32[] calldata proof) internal {
         if (!isPhaseActive(phaseId)) revert PhaseNotActive();
         Phase memory ph = _phases[phaseId];
         if (ph.merkleRoot != bytes32(0)) {
@@ -171,13 +211,18 @@ contract ERC721DropInstance is ERC721, ERC2981, Ownable, ReentrancyGuard {
         uint256 already = _minted[phasesEpoch][phaseId][msg.sender];
         if (ph.maxPerWallet != 0 && already + quantity > ph.maxPerWallet) revert WalletLimit();
         if (msg.value != uint256(ph.price) * quantity) revert WrongPayment();
+        uint256 sold = _phaseMinted[phasesEpoch][phaseId] + quantity;
+        if (ph.supplyCap != 0 && sold > ph.supplyCap) revert PhaseSoldOut();
+        _phaseMinted[phasesEpoch][phaseId] = sold;
         _minted[phasesEpoch][phaseId][msg.sender] = already + quantity;
-        uint256 first = _mintBatch(msg.sender, quantity);
-        emit Minted(msg.sender, phaseId, first, quantity, msg.value);
+        uint256 first = _mintBatch(to, quantity);
+        emit Minted(to, phaseId, first, quantity, msg.value);
     }
 
     /// @notice Free mints for the team, giveaways or migrations. They count toward `maxSupply`.
     function ownerMint(address to, uint256 quantity) external onlyOwner nonReentrant {
+        if (ownerMinted + quantity > ownerReserve) revert ReserveExceeded();
+        ownerMinted += quantity;
         uint256 first = _mintBatch(to, quantity);
         emit Minted(to, type(uint256).max, first, quantity, 0);
     }
@@ -238,6 +283,7 @@ contract ERC721DropInstance is ERC721, ERC2981, Ownable, ReentrancyGuard {
         unrevealedURI = unrevealedURI_;
         contractURI = contractURI_;
         emit MetadataUpdated(baseURI_, unrevealedURI_, contractURI_);
+        emit BatchMetadataUpdate(1, maxSupply);
     }
 
     /// @notice Freeze metadata forever. Requires a revealed `baseURI`.
@@ -248,7 +294,13 @@ contract ERC721DropInstance is ERC721, ERC2981, Ownable, ReentrancyGuard {
     }
 
     function setRoyalty(address receiver, uint96 bps) external onlyOwner {
+        if (royaltyLocked) revert Locked();
         _setDefaultRoyalty(receiver, bps);
+    }
+
+    function lockRoyalty() external onlyOwner {
+        royaltyLocked = true;
+        emit RoyaltyLocked();
     }
 
     /// @notice Disabled: mint proceeds are sent to owner() by the permissionless withdraw(), so renouncing would
@@ -269,7 +321,8 @@ contract ERC721DropInstance is ERC721, ERC2981, Ownable, ReentrancyGuard {
         if (quantity == 0) revert InvalidParams();
         first = totalSupply + 1;
         uint256 last = totalSupply + quantity;
-        if (last > maxSupply) revert SoldOut();
+        // The unused reserve stays out of reach of phases. ownerMint has already counted its own pieces.
+        if (last + ownerReserve - ownerMinted > maxSupply) revert SoldOut();
         totalSupply = last;
         for (uint256 id = first; id <= last; ++id) {
             _mint(to, id);

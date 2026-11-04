@@ -135,7 +135,7 @@ contract DeployMiyamintsForkTest is Test {
 
     function _drop() internal returns (ERC721DropInstance drop) {
         ERC721DropInstance.Phase[] memory phases = new ERC721DropInstance.Phase[](1);
-        phases[0] = ERC721DropInstance.Phase(uint64(block.timestamp), 0, 0.01 ether, 0, bytes32(0));
+        phases[0] = ERC721DropInstance.Phase(uint64(block.timestamp), 0, 0.01 ether, 0, bytes32(0), 0);
         ERC721DropInstance.InitParams memory p;
         p.name = "fork drop";
         p.symbol = "FORK";

@@ -183,6 +183,8 @@ contract ERC1155Instance is Ownable, ReentrancyGuard, IInstanceLifecycle {
     event VaultContributionRetried(address indexed vault, uint256 amount);
 
     event EditionMetadataUpdated(uint256 indexed editionId, string metadataURI);
+    /// @dev ERC-1155 metadata event, which marketplaces index.
+    event URI(string value, uint256 indexed id);
     event FreeMintClaimed(address indexed user, uint256 indexed editionId);
 
     // ┌─────────────────────────┐
@@ -340,6 +342,7 @@ contract ERC1155Instance is Ownable, ReentrancyGuard, IInstanceLifecycle {
 
         editions[editionId].metadataURI = metadataURI;
         emit EditionMetadataUpdated(editionId, metadataURI);
+        emit URI(metadataURI, editionId);
     }
 
     // ┌─────────────────────────┐

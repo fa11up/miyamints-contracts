@@ -58,7 +58,7 @@ contract MiyaDropLaunchTest is Test {
 
     function _launch(uint16 alignmentBps) internal returns (ERC721DropInstance d) {
         ERC721DropInstance.Phase[] memory phases = new ERC721DropInstance.Phase[](1);
-        phases[0] = ERC721DropInstance.Phase(uint64(block.timestamp), 0, 0.1 ether, 0, bytes32(0));
+        phases[0] = ERC721DropInstance.Phase(uint64(block.timestamp), 0, 0.1 ether, 0, bytes32(0), 0);
         ERC721DropInstance.InitParams memory p;
         p.name = "miyamaker";
         p.symbol = "MIYA";

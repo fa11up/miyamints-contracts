@@ -494,6 +494,8 @@ contract ERC1155FactoryTest is Test {
         );
 
         ERC1155Instance instanceContract = ERC1155Instance(payable(instance));
+        vm.expectEmit(address(instanceContract));
+        emit URI("ipfs://piece1-updated", 1);
         instanceContract.updateEditionMetadata(1, "ipfs://piece1-updated");
 
         ERC1155Instance.Edition memory edition = instanceContract.getEdition(1);
@@ -501,6 +503,8 @@ contract ERC1155FactoryTest is Test {
 
         vm.stopPrank();
     }
+
+    event URI(string value, uint256 indexed id);
 
     function test_CalculateMintCost_Dynamic() public {
         vm.deal(creator, 1 ether);
