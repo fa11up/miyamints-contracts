@@ -5,21 +5,17 @@ import {Test, console, console2} from "forge-std/Test.sol";
 import {ERC1155Factory} from "../../../src/factories/erc1155/ERC1155Factory.sol";
 import {ERC1155Instance, ExceedsSupply, EditionNotOpen, GatingCheckFailed, NoDynamicPricingModule} from "../../../src/factories/erc1155/ERC1155Instance.sol";
 import {DynamicPricingModule} from "../../../src/factories/erc1155/DynamicPricingModule.sol";
-import {UniAlignmentVault} from "../../../src/vaults/uni/UniAlignmentVault.sol";
+import {MockVaultV2} from "../payments/PaymentMocks.sol";
 import {MockEXECToken} from "../../mocks/MockEXECToken.sol";
-import {MockZRouter} from "../../mocks/MockZRouter.sol";
-import {MockVaultPriceValidator} from "../../mocks/MockVaultPriceValidator.sol";
-import {IVaultPriceValidator} from "../../../src/interfaces/IVaultPriceValidator.sol";
-import {LibClone} from "solady/utils/LibClone.sol";
-import {Currency} from "v4-core/types/Currency.sol";
-import {PoolKey} from "v4-core/types/PoolKey.sol";
-import {IHooks} from "v4-core/interfaces/IHooks.sol";
+import {PaymentLib} from "../../../src/libraries/PaymentLib.sol";
+import {TokenPrice} from "../../../src/factories/interfaces/TokenPrice.sol";
 import {MiyaRegistry} from "../../../src/registry/MiyaRegistry.sol";
 import {IMiyaRegistry} from "../../../src/registry/interfaces/IMiyaRegistry.sol";
 import {ICreateX, CREATEX} from "../../../src/shared/CreateXConstants.sol";
 import {CREATEX_BYTECODE} from "createx-forge/script/CreateX.d.sol";
 import {FreeMintParams} from "../../../src/interfaces/IFactoryTypes.sol";
 import {GatingScope} from "../../../src/gating/IGatingModule.sol";
+import {PasswordTierGatingModule} from "../../../src/gating/PasswordTierGatingModule.sol";
 
 contract MockRejectGatingModule {
     function canMint(address, uint256, bytes calldata) external pure returns (bool allowed, bool permanent) {
@@ -43,7 +39,7 @@ contract MockAllowGatingModule {
  */
 contract ERC1155FactoryTest is Test {
     ERC1155Factory public factory;
-    UniAlignmentVault public vault;
+    MockVaultV2 public vault;
     MockEXECToken public token;
     MiyaRegistry public registry;
     DynamicPricingModule public dynamicPricingModule;
@@ -80,8 +76,18 @@ contract ERC1155FactoryTest is Test {
             alignmentBps: ALIGNMENT_BPS,
             styleUri: "",
             gatingModule: address(0),
-            freeMint: FreeMintParams({allocation: 0, scope: GatingScope.BOTH})
+            freeMint: FreeMintParams({allocation: 0, scope: GatingScope.BOTH}),
+            acceptedTokens: _ethOnly()
         });
+    }
+
+    function _ethOnly() internal pure returns (address[] memory t) {
+        t = new address[](1); // ETH
+    }
+
+    function _eth(uint256 price) internal pure returns (TokenPrice[] memory p) {
+        p = new TokenPrice[](1);
+        p[0] = TokenPrice(address(0), price);
     }
 
     function setUp() public {
@@ -103,34 +109,9 @@ contract ERC1155FactoryTest is Test {
         vm.stopPrank();
         vm.startPrank(owner);
 
-        // Deploy vault (WETH, PoolManager, V3Router, V2Router, V2Factory, V3Factory, AlignmentToken)
-        {
-            UniAlignmentVault _impl = new UniAlignmentVault();
-            vault = UniAlignmentVault(payable(LibClone.clone(address(_impl))));
-            vault.initialize(
-                owner,
-                address(0x2222222222222222222222222222222222222222),  // WETH
-                address(0x4444444444444444444444444444444444444444),  // V4 pool manager
-                address(token),                                       // alignment target
-                address(new MockZRouter()),
-                3000,
-                60,
-                IVaultPriceValidator(address(new MockVaultPriceValidator())),
-                IMiyaRegistry(address(registry)),
-                TARGET_ID
-            );
-        }
-
-        // Set V4 pool key
-        // H-02: Hook requires native ETH (address(0)), not WETH
-        PoolKey memory mockPoolKey = PoolKey({
-            currency0: Currency.wrap(address(0)),  // Native ETH
-            currency1: Currency.wrap(address(token)),
-            fee: 3000,
-            tickSpacing: 60,
-            hooks: IHooks(address(0))
-        });
-        vault.setV4PoolKey(mockPoolKey);
+        // Vault v2 stand-in (collections only send it their cut); the real vault keeps a 0.001 ETH minimum.
+        vault = new MockVaultV2();
+        vault.setMinContribution(address(0), 0.001 ether);
 
         // Deploy factory
         factory = new ERC1155Factory(IMiyaRegistry(address(registry)), address(0xBEEF));
@@ -182,7 +163,8 @@ contract ERC1155FactoryTest is Test {
                 alignmentBps: ALIGNMENT_BPS,
                 styleUri: "",
                 gatingModule: address(0),
-                freeMint: FreeMintParams({allocation: 0, scope: GatingScope.BOTH})
+                freeMint: FreeMintParams({allocation: 0, scope: GatingScope.BOTH}),
+                acceptedTokens: _ethOnly()
             })
         );
 
@@ -233,7 +215,7 @@ contract ERC1155FactoryTest is Test {
 
         ERC1155Instance(payable(instance)).addEdition(
             "Piece 1",
-            0.1 ether,
+            _eth(0.1 ether),
             0, // Unlimited
             "ipfs://piece1",
             ERC1155Instance.PricingModel.UNLIMITED,
@@ -245,7 +227,7 @@ contract ERC1155FactoryTest is Test {
         ERC1155Instance.Edition memory edition = instanceContract.getEdition(1);
         assertEq(edition.id, 1);
         assertEq(edition.pieceTitle, "Piece 1");
-        assertEq(edition.basePrice, 0.1 ether);
+        assertEq(edition.prices[0].price, 0.1 ether);
         assertEq(edition.supply, 0);
         assertEq(uint256(edition.pricingModel), uint256(ERC1155Instance.PricingModel.UNLIMITED));
 
@@ -262,7 +244,7 @@ contract ERC1155FactoryTest is Test {
 
         ERC1155Instance(payable(instance)).addEdition(
             "Piece 2",
-            0.2 ether,
+            _eth(0.2 ether),
             100, // Limited
             "ipfs://piece2",
             ERC1155Instance.PricingModel.LIMITED_FIXED,
@@ -288,7 +270,7 @@ contract ERC1155FactoryTest is Test {
 
         ERC1155Instance(payable(instance)).addEdition(
             "Piece 3",
-            0.1 ether,
+            _eth(0.1 ether),
             50, // Limited
             "ipfs://piece3",
             ERC1155Instance.PricingModel.LIMITED_DYNAMIC,
@@ -314,7 +296,7 @@ contract ERC1155FactoryTest is Test {
         );
         ERC1155Instance(payable(instance)).addEdition(
             "Piece 1",
-            0.1 ether,
+            _eth(0.1 ether),
             0, // Unlimited
             "ipfs://piece1",
             ERC1155Instance.PricingModel.UNLIMITED,
@@ -327,7 +309,7 @@ contract ERC1155FactoryTest is Test {
         ERC1155Instance instanceContract = ERC1155Instance(payable(instance));
 
         // Mint 5 tokens
-        instanceContract.mint{value: 0.5 ether}(1, 5, bytes32(0), "", 0);
+        instanceContract.mint{value: 0.5 ether}(1, 5, bytes32(0), "", address(0), 0);
 
         assertEq(instanceContract.balanceOf(minter1, 1), 5);
         ERC1155Instance.Edition memory edition = instanceContract.getEdition(1);
@@ -346,7 +328,7 @@ contract ERC1155FactoryTest is Test {
         );
         ERC1155Instance(payable(instance)).addEdition(
             "Piece 2",
-            0.2 ether,
+            _eth(0.2 ether),
             10, // Limited to 10
             "ipfs://piece2",
             ERC1155Instance.PricingModel.LIMITED_FIXED,
@@ -359,17 +341,17 @@ contract ERC1155FactoryTest is Test {
         ERC1155Instance instanceContract = ERC1155Instance(payable(instance));
 
         // Mint 5 tokens
-        instanceContract.mint{value: 1 ether}(1, 5, bytes32(0), "", 0);
+        instanceContract.mint{value: 1 ether}(1, 5, bytes32(0), "", address(0), 0);
         assertEq(instanceContract.balanceOf(minter1, 1), 5);
         ERC1155Instance.Edition memory edition1 = instanceContract.getEdition(1);
         assertEq(edition1.minted, 5);
 
         // Try to mint 6 more (would exceed supply)
         vm.expectRevert(ExceedsSupply.selector);
-        instanceContract.mint{value: 1.2 ether}(1, 6, bytes32(0), "", 0);
+        instanceContract.mint{value: 1.2 ether}(1, 6, bytes32(0), "", address(0), 0);
 
         // Mint remaining 5
-        instanceContract.mint{value: 1 ether}(1, 5, bytes32(0), "", 0);
+        instanceContract.mint{value: 1 ether}(1, 5, bytes32(0), "", address(0), 0);
         ERC1155Instance.Edition memory edition2 = instanceContract.getEdition(1);
         assertEq(edition2.minted, 10);
 
@@ -386,7 +368,7 @@ contract ERC1155FactoryTest is Test {
         );
         ERC1155Instance(payable(instance)).addEdition(
             "Piece 3",
-            0.1 ether,
+            _eth(0.1 ether),
             10, // Limited to 10
             "ipfs://piece3",
             ERC1155Instance.PricingModel.LIMITED_DYNAMIC,
@@ -399,14 +381,14 @@ contract ERC1155FactoryTest is Test {
         ERC1155Instance instanceContract = ERC1155Instance(payable(instance));
 
         // Get current price (should be base price for first mint)
-        uint256 price1 = instanceContract.getCurrentPrice(1);
+        uint256 price1 = instanceContract.getCurrentPrice(1, address(0));
         assertEq(price1, 0.1 ether);
 
         // Mint 1 token
-        instanceContract.mint{value: 0.2 ether}(1, 1, bytes32(0), "", 0);
+        instanceContract.mint{value: 0.2 ether}(1, 1, bytes32(0), "", address(0), 0);
 
         // Price should increase for next mint
-        uint256 price2 = instanceContract.getCurrentPrice(1);
+        uint256 price2 = instanceContract.getCurrentPrice(1, address(0));
         assertGt(price2, price1);
 
         vm.stopPrank();
@@ -422,7 +404,7 @@ contract ERC1155FactoryTest is Test {
         );
         ERC1155Instance(payable(instance)).addEdition(
             "Piece 1",
-            0.1 ether,
+            _eth(0.1 ether),
             0,
             "ipfs://piece1",
             ERC1155Instance.PricingModel.UNLIMITED,
@@ -439,7 +421,7 @@ contract ERC1155FactoryTest is Test {
         instanceContract.mint{value: 0.1 ether}(
             1,
             1,
-            bytes32(0), "Hello from minter!",
+            bytes32(0), "Hello from minter!", address(0),
             0
         );
 
@@ -454,16 +436,22 @@ contract ERC1155FactoryTest is Test {
             _nextSalt(), _params("Anyone", creator, address(vault))
         );
         ERC1155Instance inst = ERC1155Instance(payable(instance));
-        inst.addEdition("P", 1 ether, 0, "ipfs://p", ERC1155Instance.PricingModel.UNLIMITED, 0, 0);
+        inst.addEdition("P", _eth(1 ether), 0, "ipfs://p", ERC1155Instance.PricingModel.UNLIMITED, 0, 0);
         vm.stopPrank();
         vm.prank(minter1);
-        inst.mint{value: 1 ether}(1, 1, bytes32(0), "", 1 ether);
+        inst.mint{value: 1 ether}(1, 1, bytes32(0), "", address(0), 1 ether);
 
         uint256 before = creator.balance;
         vm.prank(makeAddr("stranger"));
-        inst.withdraw(1 ether);
-        assertEq(inst.totalWithdrawn(), 1 ether);
-        assertGt(creator.balance, before);
+        inst.distribute(address(0));
+        assertEq(inst.unsplitProceeds(address(0)), 0);
+        assertEq(inst.ownerBalance(address(0)), 0.8 ether);
+        vm.prank(makeAddr("stranger"));
+        vm.expectRevert();
+        inst.withdraw(address(0));
+        vm.prank(creator);
+        inst.withdraw(address(0));
+        assertEq(creator.balance - before, 0.8 ether);
     }
 
     function test_Withdraw_Tax() public {
@@ -476,7 +464,7 @@ contract ERC1155FactoryTest is Test {
         );
         ERC1155Instance(payable(instance)).addEdition(
             "Piece 1",
-            1 ether,
+            _eth(1 ether),
             0,
             "ipfs://piece1",
             ERC1155Instance.PricingModel.UNLIMITED,
@@ -487,12 +475,12 @@ contract ERC1155FactoryTest is Test {
 
         vm.startPrank(minter1);
         ERC1155Instance instanceContract = ERC1155Instance(payable(instance));
-        instanceContract.mint{value: 1 ether}(1, 1, bytes32(0), "", 0);
+        instanceContract.mint{value: 1 ether}(1, 1, bytes32(0), "", address(0), 0);
         vm.stopPrank();
 
         vm.startPrank(creator);
-        // Withdraw 1 ETH
-        instanceContract.withdraw(1 ether);
+        // Withdraw the ETH proceeds (split first)
+        instanceContract.withdraw(address(0));
         vm.stopPrank();
     }
 
@@ -505,7 +493,7 @@ contract ERC1155FactoryTest is Test {
         );
         ERC1155Instance(payable(instance)).addEdition(
             "Piece 1",
-            0.1 ether,
+            _eth(0.1 ether),
             0,
             "ipfs://piece1",
             ERC1155Instance.PricingModel.UNLIMITED,
@@ -535,7 +523,7 @@ contract ERC1155FactoryTest is Test {
         );
         ERC1155Instance(payable(instance)).addEdition(
             "Piece 3",
-            0.1 ether,
+            _eth(0.1 ether),
             10,
             "ipfs://piece3",
             ERC1155Instance.PricingModel.LIMITED_DYNAMIC,
@@ -546,7 +534,7 @@ contract ERC1155FactoryTest is Test {
         ERC1155Instance instanceContract = ERC1155Instance(payable(instance));
 
         // Calculate cost for minting 3 tokens
-        uint256 cost = instanceContract.calculateMintCost(1, 3);
+        uint256 cost = instanceContract.calculateMintCost(1, 3, address(0));
         assertGt(cost, 0.3 ether); // Should be more than base price * 3 due to increases
 
         vm.stopPrank();
@@ -561,7 +549,7 @@ contract ERC1155FactoryTest is Test {
         );
         ERC1155Instance(payable(instance)).addEdition(
             "Test Piece",
-            0.1 ether,
+            _eth(0.1 ether),
             100,
             "ipfs://test-piece",
             ERC1155Instance.PricingModel.LIMITED_FIXED,
@@ -572,11 +560,11 @@ contract ERC1155FactoryTest is Test {
         ERC1155Instance instanceContract = ERC1155Instance(payable(instance));
 
         ERC1155Instance.Edition memory ed = instanceContract.getEdition(1);
-        uint256 currentPrice = instanceContract.getCurrentPrice(1);
+        uint256 currentPrice = instanceContract.getCurrentPrice(1, address(0));
 
         assertEq(ed.id, 1);
         assertEq(ed.pieceTitle, "Test Piece");
-        assertEq(ed.basePrice, 0.1 ether);
+        assertEq(ed.prices[0].price, 0.1 ether);
         assertEq(currentPrice, 0.1 ether);
         assertEq(ed.supply, 100);
         assertEq(ed.minted, 0);
@@ -594,9 +582,9 @@ contract ERC1155FactoryTest is Test {
         address instance = factory.createInstance{value: 0}(
             _nextSalt(), _params("Test Collection", creator, address(vault))
         );
-        ERC1155Instance(payable(instance)).addEdition("Piece 1", 0.1 ether, 0, "ipfs://1", ERC1155Instance.PricingModel.UNLIMITED, 0, 0);
-        ERC1155Instance(payable(instance)).addEdition("Piece 2", 0.2 ether, 100, "ipfs://2", ERC1155Instance.PricingModel.LIMITED_FIXED, 0, 0);
-        ERC1155Instance(payable(instance)).addEdition("Piece 3", 0.3 ether, 50, "ipfs://3", ERC1155Instance.PricingModel.LIMITED_DYNAMIC, 100, 0);
+        ERC1155Instance(payable(instance)).addEdition("Piece 1", _eth(0.1 ether), 0, "ipfs://1", ERC1155Instance.PricingModel.UNLIMITED, 0, 0);
+        ERC1155Instance(payable(instance)).addEdition("Piece 2", _eth(0.2 ether), 100, "ipfs://2", ERC1155Instance.PricingModel.LIMITED_FIXED, 0, 0);
+        ERC1155Instance(payable(instance)).addEdition("Piece 3", _eth(0.3 ether), 50, "ipfs://3", ERC1155Instance.PricingModel.LIMITED_DYNAMIC, 100, 0);
 
         ERC1155Instance instanceContract = ERC1155Instance(payable(instance));
 
@@ -618,8 +606,8 @@ contract ERC1155FactoryTest is Test {
         address instance = factory.createInstance{value: 0}(
             _nextSalt(), _params("Test Collection", creator, address(vault))
         );
-        ERC1155Instance(payable(instance)).addEdition("Piece 1", 0.1 ether, 0, "ipfs://1", ERC1155Instance.PricingModel.UNLIMITED, 0, 0);
-        ERC1155Instance(payable(instance)).addEdition("Piece 2", 0.2 ether, 100, "ipfs://2", ERC1155Instance.PricingModel.LIMITED_FIXED, 0, 0);
+        ERC1155Instance(payable(instance)).addEdition("Piece 1", _eth(0.1 ether), 0, "ipfs://1", ERC1155Instance.PricingModel.UNLIMITED, 0, 0);
+        ERC1155Instance(payable(instance)).addEdition("Piece 2", _eth(0.2 ether), 100, "ipfs://2", ERC1155Instance.PricingModel.LIMITED_FIXED, 0, 0);
 
         ERC1155Instance instanceContract = ERC1155Instance(payable(instance));
 
@@ -628,10 +616,10 @@ contract ERC1155FactoryTest is Test {
 
         assertEq(ed1.id, 1);
         assertEq(ed1.pieceTitle, "Piece 1");
-        assertEq(ed1.basePrice, 0.1 ether);
+        assertEq(ed1.prices[0].price, 0.1 ether);
         assertEq(ed2.id, 2);
         assertEq(ed2.pieceTitle, "Piece 2");
-        assertEq(ed2.basePrice, 0.2 ether);
+        assertEq(ed2.prices[0].price, 0.2 ether);
 
         vm.stopPrank();
     }
@@ -651,7 +639,7 @@ contract ERC1155FactoryTest is Test {
         assertEq(instanceContract.factory(), address(factory));
         assertEq(address(instanceContract.vault()), address(vault));
         assertEq(instanceContract.getEditionCount(), 0);
-        assertEq(instanceContract.totalProceeds(), 0);
+        assertEq(instanceContract.totalProceeds(address(0)), 0);
 
         vm.stopPrank();
     }
@@ -665,7 +653,7 @@ contract ERC1155FactoryTest is Test {
         );
         ERC1155Instance(payable(instance)).addEdition(
             "Piece 1",
-            0.1 ether,
+            _eth(0.1 ether),
             100,
             "ipfs://piece1",
             ERC1155Instance.PricingModel.LIMITED_FIXED,
@@ -676,10 +664,10 @@ contract ERC1155FactoryTest is Test {
         ERC1155Instance instanceContract = ERC1155Instance(payable(instance));
 
         ERC1155Instance.Edition memory ed = instanceContract.getEdition(1);
-        uint256 currentPrice = instanceContract.getCurrentPrice(1);
+        uint256 currentPrice = instanceContract.getCurrentPrice(1, address(0));
         uint256 available = ed.supply > ed.minted ? ed.supply - ed.minted : 0;
 
-        assertEq(ed.basePrice, 0.1 ether);
+        assertEq(ed.prices[0].price, 0.1 ether);
         assertEq(currentPrice, 0.1 ether);
         assertEq(uint256(ed.pricingModel), uint256(ERC1155Instance.PricingModel.LIMITED_FIXED));
         assertEq(ed.supply, 100);
@@ -699,7 +687,7 @@ contract ERC1155FactoryTest is Test {
         );
         ERC1155Instance(payable(instance)).addEdition(
             "Piece 1",
-            0.1 ether,
+            _eth(0.1 ether),
             10,
             "ipfs://piece1",
             ERC1155Instance.PricingModel.LIMITED_FIXED,
@@ -710,7 +698,7 @@ contract ERC1155FactoryTest is Test {
 
         vm.startPrank(minter1);
         ERC1155Instance instanceContract = ERC1155Instance(payable(instance));
-        instanceContract.mint{value: 0.5 ether}(1, 5, bytes32(0), "", 0);
+        instanceContract.mint{value: 0.5 ether}(1, 5, bytes32(0), "", address(0), 0);
         vm.stopPrank();
 
         ERC1155Instance.Edition memory ed = instanceContract.getEdition(1);
@@ -754,7 +742,7 @@ contract ERC1155FactoryTest is Test {
         );
         ERC1155Instance(payable(instance)).addEdition(
             "Piece 1",
-            0.1 ether,
+            _eth(0.1 ether),
             100,
             "ipfs://piece1",
             ERC1155Instance.PricingModel.LIMITED_FIXED,
@@ -804,7 +792,8 @@ contract ERC1155FactoryTest is Test {
                 alignmentBps: ALIGNMENT_BPS,
                 styleUri: "",
                 gatingModule: gatingModuleAddr,
-                freeMint: FreeMintParams({allocation: 0, scope: GatingScope.BOTH})
+                freeMint: FreeMintParams({allocation: 0, scope: GatingScope.BOTH}),
+                acceptedTokens: _ethOnly()
             })
         );
     }
@@ -816,12 +805,12 @@ contract ERC1155FactoryTest is Test {
         // Add edition with openTime 1 hour from now
         uint256 openTime = block.timestamp + 1 hours;
         vm.prank(artist);
-        inst.addEdition("Art 1", 0.01 ether, 0, "ipfs://art1", ERC1155Instance.PricingModel.UNLIMITED, 0, openTime);
+        inst.addEdition("Art 1", _eth(0.01 ether), 0, "ipfs://art1", ERC1155Instance.PricingModel.UNLIMITED, 0, openTime);
         uint256 editionId = inst.nextEditionId() - 1;
 
         // Attempt to mint before openTime
         vm.expectRevert(EditionNotOpen.selector);
-        inst.mint{value: 0.01 ether}(editionId, 1, bytes32(0), "", 0);
+        inst.mint{value: 0.01 ether}(editionId, 1, bytes32(0), "", address(0), 0);
     }
 
     function test_instance_openTime_allowsMintAfterOpen() public {
@@ -830,14 +819,14 @@ contract ERC1155FactoryTest is Test {
 
         uint256 openTime = block.timestamp + 1 hours;
         vm.prank(artist);
-        inst.addEdition("Art 1", 0.01 ether, 0, "ipfs://art1", ERC1155Instance.PricingModel.UNLIMITED, 0, openTime);
+        inst.addEdition("Art 1", _eth(0.01 ether), 0, "ipfs://art1", ERC1155Instance.PricingModel.UNLIMITED, 0, openTime);
         uint256 editionId = inst.nextEditionId() - 1;
 
         // Warp past openTime
         vm.warp(block.timestamp + 2 hours);
 
         // Mint should succeed
-        inst.mint{value: 0.01 ether}(editionId, 1, bytes32(0), "", 0);
+        inst.mint{value: 0.01 ether}(editionId, 1, bytes32(0), "", address(0), 0);
         assertEq(inst.balanceOf(address(this), editionId), 1);
     }
 
@@ -847,10 +836,10 @@ contract ERC1155FactoryTest is Test {
 
         // openTime = 0 → no time gate
         vm.prank(artist);
-        inst.addEdition("Art 1", 0.01 ether, 0, "ipfs://art1", ERC1155Instance.PricingModel.UNLIMITED, 0, 0);
+        inst.addEdition("Art 1", _eth(0.01 ether), 0, "ipfs://art1", ERC1155Instance.PricingModel.UNLIMITED, 0, 0);
         uint256 editionId = inst.nextEditionId() - 1;
 
-        inst.mint{value: 0.01 ether}(editionId, 1, bytes32(0), "", 0);
+        inst.mint{value: 0.01 ether}(editionId, 1, bytes32(0), "", address(0), 0);
         assertEq(inst.balanceOf(address(this), editionId), 1);
     }
 
@@ -861,11 +850,11 @@ contract ERC1155FactoryTest is Test {
         ERC1155Instance inst = ERC1155Instance(payable(instance));
 
         vm.prank(artist);
-        inst.addEdition("Art 1", 0.01 ether, 0, "ipfs://art1", ERC1155Instance.PricingModel.UNLIMITED, 0, 0);
+        inst.addEdition("Art 1", _eth(0.01 ether), 0, "ipfs://art1", ERC1155Instance.PricingModel.UNLIMITED, 0, 0);
         uint256 editionId = inst.nextEditionId() - 1;
 
         vm.expectRevert(GatingCheckFailed.selector);
-        inst.mint{value: 0.01 ether}(editionId, 1, bytes32(0), "", 0);
+        inst.mint{value: 0.01 ether}(editionId, 1, bytes32(0), "", address(0), 0);
     }
 
     function test_instance_gating_allowsMintOnPassingCheck() public {
@@ -875,10 +864,112 @@ contract ERC1155FactoryTest is Test {
         ERC1155Instance inst = ERC1155Instance(payable(instance));
 
         vm.prank(artist);
-        inst.addEdition("Art 1", 0.01 ether, 0, "ipfs://art1", ERC1155Instance.PricingModel.UNLIMITED, 0, 0);
+        inst.addEdition("Art 1", _eth(0.01 ether), 0, "ipfs://art1", ERC1155Instance.PricingModel.UNLIMITED, 0, 0);
         uint256 editionId = inst.nextEditionId() - 1;
 
-        inst.mint{value: 0.01 ether}(editionId, 1, bytes32(0), "", 0);
+        inst.mint{value: 0.01 ether}(editionId, 1, bytes32(0), "", address(0), 0);
+        assertEq(inst.balanceOf(address(this), editionId), 1);
+    }
+
+    // ── gatingScope ───────────────────────────────────────────────────────────
+
+    function _deployScoped(address gatingModuleAddr, GatingScope scope) internal returns (ERC1155Instance inst) {
+        vm.prank(registryOwner);
+        registry.setComponent(gatingModuleAddr, true);
+        vm.deal(artist, 1 ether);
+        vm.prank(artist);
+        inst = ERC1155Instance(payable(factory.createInstance{value: 0}(
+            _nextSalt(),
+            ERC1155Factory.CreateParams({
+                name: "ScopedProject",
+                metadataURI: "ipfs://Qm",
+                creator: artist,
+                vault: address(vault),
+                alignmentBps: ALIGNMENT_BPS,
+                styleUri: "",
+                gatingModule: gatingModuleAddr,
+                freeMint: FreeMintParams({allocation: 5, scope: scope}),
+                acceptedTokens: _ethOnly()
+            })
+        )));
+    }
+
+    function _scopedEdition(ERC1155Instance inst) internal returns (uint256) {
+        vm.prank(artist);
+        inst.addEdition("Art 1", _eth(0.01 ether), 0, "ipfs://art1", ERC1155Instance.PricingModel.UNLIMITED, 0, 0);
+        return inst.nextEditionId() - 1;
+    }
+
+    function test_gatingScope_freeMintOnly_paidMintIsOpenFreeMintIsGated() public {
+        ERC1155Instance inst = _deployScoped(address(new MockRejectGatingModule()), GatingScope.FREE_MINT_ONLY);
+        uint256 editionId = _scopedEdition(inst);
+
+        inst.mint{value: 0.01 ether}(editionId, 1, bytes32(0), "", address(0), 0);
+        assertEq(inst.balanceOf(address(this), editionId), 1);
+
+        vm.expectRevert(GatingCheckFailed.selector);
+        inst.claimFreeMint(editionId, "");
+    }
+
+    function test_gatingScope_paidOnly_paidMintIsGatedFreeMintIsOpen() public {
+        ERC1155Instance inst = _deployScoped(address(new MockRejectGatingModule()), GatingScope.PAID_ONLY);
+        uint256 editionId = _scopedEdition(inst);
+
+        vm.expectRevert(GatingCheckFailed.selector);
+        inst.mint{value: 0.01 ether}(editionId, 1, bytes32(0), "", address(0), 0);
+
+        inst.claimFreeMint(editionId, "");
+        assertEq(inst.balanceOf(address(this), editionId), 1);
+    }
+
+    function test_gatingScope_both_gatesEach() public {
+        ERC1155Instance inst = _deployScoped(address(new MockRejectGatingModule()), GatingScope.BOTH);
+        uint256 editionId = _scopedEdition(inst);
+
+        vm.expectRevert(GatingCheckFailed.selector);
+        inst.mint{value: 0.01 ether}(editionId, 1, bytes32(0), "", address(0), 0);
+        vm.expectRevert(GatingCheckFailed.selector);
+        inst.claimFreeMint(editionId, "");
+    }
+
+    function test_claimFreeMint_callerCannotChooseOpenTimeToSkipTierLock() public {
+        PasswordTierGatingModule module = new PasswordTierGatingModule(address(registry));
+        ERC1155Instance inst = _deployScoped(address(module), GatingScope.BOTH);
+        uint256 openAt = block.timestamp + 1 hours;
+        vm.prank(artist);
+        inst.addEdition("Art 1", _eth(0.01 ether), 0, "ipfs://art1", ERC1155Instance.PricingModel.UNLIMITED, 0, openAt);
+        uint256 editionId = inst.nextEditionId() - 1;
+
+        bytes32 hash = keccak256("tier1");
+        bytes32[] memory hashes = new bytes32[](1);
+        hashes[0] = hash;
+        uint256[] memory unlocks = new uint256[](1);
+        unlocks[0] = 1 days;
+        vm.prank(address(factory));
+        module.configureFor(address(inst), PasswordTierGatingModule.TierConfig({
+            tierType: PasswordTierGatingModule.TierType.TIME_BASED,
+            passwordHashes: hashes,
+            volumeCaps: new uint256[](0),
+            tierUnlockTimes: unlocks
+        }));
+        vm.warp(openAt);
+
+        // Encoding openTime = 0 used to put the unlock far in the past.
+        vm.expectRevert(PasswordTierGatingModule.TierTimeLocked.selector);
+        inst.claimFreeMint(editionId, abi.encode(hash, uint256(0)));
+        vm.expectRevert(PasswordTierGatingModule.TierTimeLocked.selector);
+        inst.claimFreeMint(editionId, abi.encode(hash));
+
+        vm.warp(openAt + 1 days);
+        inst.claimFreeMint(editionId, abi.encode(hash));
+        assertEq(inst.balanceOf(address(this), editionId), 1);
+    }
+
+    function test_claimFreeMint_emptyDataIsOpenTierLikeMint() public {
+        PasswordTierGatingModule module = new PasswordTierGatingModule(address(registry));
+        ERC1155Instance inst = _deployScoped(address(module), GatingScope.BOTH);
+        uint256 editionId = _scopedEdition(inst);
+        inst.claimFreeMint(editionId, "");
         assertEq(inst.balanceOf(address(this), editionId), 1);
     }
 
@@ -900,7 +991,8 @@ contract ERC1155FactoryTest is Test {
                 alignmentBps: ALIGNMENT_BPS,
                 styleUri: "",
                 gatingModule: unapprovedModule,
-                freeMint: FreeMintParams({allocation: 0, scope: GatingScope.BOTH})
+                freeMint: FreeMintParams({allocation: 0, scope: GatingScope.BOTH}),
+                acceptedTokens: _ethOnly()
             })
         );
     }
@@ -923,7 +1015,8 @@ contract ERC1155FactoryTest is Test {
                 alignmentBps: ALIGNMENT_BPS,
                 styleUri: "",
                 gatingModule: mockModule,
-                freeMint: FreeMintParams({allocation: 0, scope: GatingScope.BOTH})
+                freeMint: FreeMintParams({allocation: 0, scope: GatingScope.BOTH}),
+                acceptedTokens: _ethOnly()
             })
         );
 
@@ -952,7 +1045,7 @@ contract ERC1155FactoryTest is Test {
         vm.prank(artist);
         ERC1155Instance(payable(instance)).addEdition(
             "Art 1",
-            0.01 ether,
+            _eth(0.01 ether),
             0,
             "ipfs://art1",
             ERC1155Instance.PricingModel.UNLIMITED,
@@ -982,13 +1075,14 @@ contract ERC1155FactoryTest is Test {
                 alignmentBps: ALIGNMENT_BPS,
                 styleUri: "",
                 gatingModule: address(0),
-                freeMint: FreeMintParams({allocation: 0, scope: GatingScope.BOTH})
+                freeMint: FreeMintParams({allocation: 0, scope: GatingScope.BOTH}),
+                acceptedTokens: _ethOnly()
             })
         );
 
         vm.expectRevert(NoDynamicPricingModule.selector);
         ERC1155Instance(payable(instance)).addEdition(
-            "Dynamic Piece", 0.1 ether, 100, "ipfs://piece",
+            "Dynamic Piece", _eth(0.1 ether), 100, "ipfs://piece",
             ERC1155Instance.PricingModel.LIMITED_DYNAMIC, 100, 0
         );
         vm.stopPrank();
@@ -1007,5 +1101,59 @@ contract ERC1155FactoryTest is Test {
         factory.setDynamicPricingModule(address(0));
         assertEq(factory.dynamicPricingModule(), address(0));
         vm.stopPrank();
+    }
+
+    // ── parked vault cuts ─────────────────────────────────────────────────────
+
+    /// @dev Sells 0.005 ETH and withdraws it: a 19% cut of 0.00095 ETH, under the vault's 0.001 minimum, so it parks.
+    ///      With nothing left to sell, no later withdraw would carry it.
+    function _instanceWithDustParked() internal returns (ERC1155Instance inst) {
+        vm.startPrank(creator);
+        inst = ERC1155Instance(payable(factory.createInstance(_nextSalt(), _params("Dust", creator, address(vault)))));
+        inst.addEdition("P", _eth(0.005 ether), 1, "ipfs://p", ERC1155Instance.PricingModel.LIMITED_FIXED, 0, 0);
+        vm.stopPrank();
+        vm.deal(minter1, 1 ether);
+        vm.prank(minter1);
+        inst.mint{value: 0.005 ether}(1, 1, bytes32(0), "", address(0), 0);
+        inst.distribute(address(0));
+        assertEq(inst.pendingVaultCut(address(0)), 0.00095 ether);
+        assertEq(address(inst).balance, 0.00095 ether + inst.ownerBalance(address(0)));
+    }
+
+    function test_RetryVaultContribution_DustCanBeToppedUpToReachTheVault() public {
+        ERC1155Instance inst = _instanceWithDustParked();
+
+        vm.expectRevert(bytes("below minimum"));
+        inst.flushPendingVaultCut(address(0), 0);
+
+        // not enough: reverts, so the helper keeps its ETH and the cut stays parked
+        vm.deal(minter2, 1 ether);
+        vm.prank(minter2);
+        vm.expectRevert(bytes("below minimum"));
+        inst.flushPendingVaultCut{value: 0.00004 ether}(address(0), 0.00004 ether);
+        assertEq(minter2.balance, 1 ether);
+        assertEq(inst.pendingVaultCut(address(0)), 0.00095 ether);
+
+        uint256 vaultBefore = address(vault).balance;
+        vm.expectEmit(address(inst));
+        emit PaymentLib.VaultContributionRetried(address(0), 0.001 ether);
+        vm.prank(minter2);
+        inst.flushPendingVaultCut{value: 0.00005 ether}(address(0), 0.00005 ether);
+        assertEq(inst.pendingVaultCut(address(0)), 0);
+        assertEq(address(inst).balance, inst.ownerBalance(address(0)));
+        assertEq(address(vault).balance - vaultBefore, 0.001 ether);
+        // credited to the collection, not to whoever topped it up
+        assertEq(vault.credited(address(inst), address(0)), 0.001 ether);
+        assertEq(vault.credited(minter2, address(0)), 0);
+    }
+
+    function test_RetryVaultContribution_ToppingUpNothingParkedReverts() public {
+        vm.prank(creator);
+        ERC1155Instance inst =
+            ERC1155Instance(payable(factory.createInstance(_nextSalt(), _params("None", creator, address(vault)))));
+        vm.deal(minter1, 1 ether);
+        vm.prank(minter1);
+        vm.expectRevert(PaymentLib.NothingParked.selector);
+        inst.flushPendingVaultCut{value: 0.01 ether}(address(0), 0.01 ether);
     }
 }

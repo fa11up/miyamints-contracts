@@ -9,6 +9,7 @@ import {ERC1155Instance} from "./ERC1155Instance.sol";
 import {IFactory} from "../../interfaces/IFactory.sol";
 import {FreeMintParams} from "../../interfaces/IFactoryTypes.sol";
 import {ICreateX, CREATEX} from "../../shared/CreateXConstants.sol";
+import {InitCodeStore} from "../shared/InitCodeStore.sol";
 
 /**
  * @title ERC1155Factory
@@ -16,6 +17,7 @@ import {ICreateX, CREATEX} from "../../shared/CreateXConstants.sol";
  *         Single responsibility: validate → deploy via CREATE3 → register.
  *         Each instance snapshots the registry's treasury and protocol fee plus the creator's chosen
  *         alignment share at launch. Any creation fee is forwarded to the registry treasury — no custody.
+ *         Accepted payment tokens are checked against the registry's payment-token allowlist by the instance.
  */
 contract ERC1155Factory is Ownable, ReentrancyGuard, IFactory {
     error InvalidAddress();
@@ -29,6 +31,9 @@ contract ERC1155Factory is Ownable, ReentrancyGuard, IFactory {
     bytes32 public constant DYNAMIC_PRICING = keccak256("dynamic_pricing");
 
     IMiyaRegistry public immutable registry;
+    /// @dev ERC1155Instance creation code, in SSTORE2 data contracts (see InitCodeStore).
+    address internal immutable _codeA;
+    address internal immutable _codeB;
     address public weth;
     address public dynamicPricingModule;
 
@@ -43,6 +48,7 @@ contract ERC1155Factory is Ownable, ReentrancyGuard, IFactory {
         string styleUri;
         address gatingModule;    // address(0) = open
         FreeMintParams freeMint;
+        address[] acceptedTokens; // payment tokens (address(0) = ETH), each on the registry allowlist
     }
 
     event InstanceCreated(
@@ -60,6 +66,7 @@ contract ERC1155Factory is Ownable, ReentrancyGuard, IFactory {
         _initializeOwner(msg.sender);
         registry = _registry;
         weth = _weth;
+        (_codeA, _codeB) = InitCodeStore.write(type(ERC1155Instance).creationCode);
     }
 
     /// @notice Deploy a new ERC1155 instance. Any ETH is forwarded directly to the registry treasury.
@@ -105,10 +112,12 @@ contract ERC1155Factory is Ownable, ReentrancyGuard, IFactory {
             alignmentBps: params.alignmentBps,
             gatingModule: params.gatingModule,
             dynamicPricingModule: dynamicPricingModule,
-            weth: weth
+            weth: weth,
+            registry: address(registry),
+            acceptedTokens: params.acceptedTokens
         });
         return abi.encodePacked(
-            type(ERC1155Instance).creationCode,
+            InitCodeStore.read(_codeA, _codeB),
             abi.encode(params.name, params.creator, address(this), params.vault, params.styleUri, init)
         );
     }

@@ -9,6 +9,7 @@ import {ERC721AuctionInstance} from "./ERC721AuctionInstance.sol";
 import {IAlignmentVault} from "../../interfaces/IAlignmentVault.sol";
 import {IFactory} from "../../interfaces/IFactory.sol";
 import {ICreateX, CREATEX} from "../../shared/CreateXConstants.sol";
+import {InitCodeStore} from "../shared/InitCodeStore.sol";
 
 /**
  * @title ERC721AuctionFactory
@@ -16,6 +17,8 @@ import {ICreateX, CREATEX} from "../../shared/CreateXConstants.sol";
  *         Single responsibility: validate → deploy via CREATE3 → register.
  *         Each instance snapshots the registry's treasury and protocol fee plus the creator's chosen
  *         alignment share at launch. Any creation fee is forwarded to the registry treasury — no custody.
+ *         The creator picks the collection's one auction currency; the instance checks it against the registry's
+ *         payment-token allowlist.
  */
 contract ERC721AuctionFactory is Ownable, ReentrancyGuard, IFactory {
     error InvalidAddress();
@@ -24,6 +27,9 @@ contract ERC721AuctionFactory is Ownable, ReentrancyGuard, IFactory {
     error NotCreator();
 
     IMiyaRegistry public immutable registry;
+    /// @dev ERC721AuctionInstance creation code, in SSTORE2 data contracts (see InitCodeStore).
+    address internal immutable _codeA;
+    address internal immutable _codeB;
     address public weth;
 
     struct CreateParams {
@@ -36,7 +42,8 @@ contract ERC721AuctionFactory is Ownable, ReentrancyGuard, IFactory {
         uint8 lines;
         uint40 baseDuration;
         uint40 timeBuffer;
-        uint256 bidIncrement;
+        uint256 bidIncrement;    // in `currency` units
+        address currency;        // address(0) = ETH, else an ERC-20 on the registry's payment-token allowlist
     }
 
     event InstanceCreated(
@@ -55,6 +62,7 @@ contract ERC721AuctionFactory is Ownable, ReentrancyGuard, IFactory {
         _initializeOwner(msg.sender);
         registry = _registry;
         weth = _weth;
+        (_codeA, _codeB) = InitCodeStore.write(type(ERC721AuctionInstance).creationCode);
     }
 
     /// @notice Deploy a new ERC721 auction instance. Any ETH is forwarded directly to the registry treasury.
@@ -97,7 +105,7 @@ contract ERC721AuctionFactory is Ownable, ReentrancyGuard, IFactory {
         returns (address instance)
     {
         bytes memory initCode = abi.encodePacked(
-            type(ERC721AuctionInstance).creationCode,
+            InitCodeStore.read(_codeA, _codeB),
             abi.encode(
                 ERC721AuctionInstance.ConstructorParams({
                     vault: params.vault,
@@ -112,7 +120,9 @@ contract ERC721AuctionFactory is Ownable, ReentrancyGuard, IFactory {
                     timeBuffer: params.timeBuffer,
                     bidIncrement: params.bidIncrement,
                     factory: address(this),
-                    weth: weth
+                    weth: weth,
+                    registry: address(registry),
+                    currency: params.currency
                 })
             )
         );

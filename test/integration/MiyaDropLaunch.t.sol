@@ -8,8 +8,12 @@ import { MiyaRegistry } from "../../src/registry/MiyaRegistry.sol";
 import { IMiyaRegistry } from "../../src/registry/interfaces/IMiyaRegistry.sol";
 import { ERC721DropFactory } from "../../src/factories/erc721drop/ERC721DropFactory.sol";
 import { ERC721DropInstance } from "../../src/factories/erc721drop/ERC721DropInstance.sol";
+import { TokenPrice } from "../../src/factories/interfaces/TokenPrice.sol";
+import { IAlignmentVault } from "../../src/interfaces/IAlignmentVault.sol";
 import { UniAlignmentVault } from "../../src/vaults/uni/UniAlignmentVault.sol";
 import { UniAlignmentVaultFactory } from "../../src/vaults/uni/UniAlignmentVaultFactory.sol";
+import { testAlignmentKey } from "../helpers/VaultV2TestKey.sol";
+import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { IVaultPriceValidator } from "../../src/interfaces/IVaultPriceValidator.sol";
 import { MockEXECToken } from "../mocks/MockEXECToken.sol";
 import { MockZRouter } from "../mocks/MockZRouter.sol";
@@ -32,14 +36,14 @@ contract MiyaDropLaunchTest is Test {
         vm.etch(CREATEX, CREATEX_BYTECODE);
         MockEXECToken token = new MockEXECToken(1_000_000e18);
         registry = new MiyaRegistry(dao, treasury, 100, 1000);
+        address imdToken = address(new MockEXECToken(1_000_000e18));
         vaultFactory = new UniAlignmentVaultFactory(
-            weth,
-            makeAddr("poolManager"),
+            IMiyaRegistry(address(registry)),
+            IPoolManager(makeAddr("poolManager")),
             address(new MockZRouter()),
-            3000,
-            60,
-            IVaultPriceValidator(address(new MockVaultPriceValidator())),
-            IMiyaRegistry(address(registry))
+            address(token),
+            imdToken,
+            testAlignmentKey(address(token), imdToken)
         );
         dropFactory = new ERC721DropFactory(IMiyaRegistry(address(registry)), weth);
 
@@ -52,18 +56,20 @@ contract MiyaDropLaunchTest is Test {
         vm.stopPrank();
 
         bytes32 salt = bytes32(abi.encodePacked(address(vaultFactory), uint8(0x00), bytes11(uint88(1))));
-        vault = vaultFactory.deployVault(salt, address(token), 0, IVaultPriceValidator(address(0)));
+        vault = vaultFactory.deployVault(salt, 0);
         vm.deal(buyer, 100 ether);
     }
 
     function _launch(uint16 alignmentBps) internal returns (ERC721DropInstance d) {
         ERC721DropInstance.Phase[] memory phases = new ERC721DropInstance.Phase[](1);
-        phases[0] = ERC721DropInstance.Phase(uint64(block.timestamp), 0, 0.1 ether, 0, bytes32(0), 0);
+        phases[0] = ERC721DropInstance.Phase(uint64(block.timestamp), 0, 0, bytes32(0), 0, new TokenPrice[](1));
+        phases[0].prices[0] = TokenPrice(address(0), 0.1 ether);
         ERC721DropInstance.InitParams memory p;
         p.name = "miyamaker";
         p.symbol = "MIYA";
         p.maxSupply = 1000;
         p.unrevealedURI = "ar://unrevealed.json";
+        p.acceptedTokens = new address[](1); // ETH
         p.phases = phases;
         vm.prank(artist);
         d = ERC721DropInstance(payable(dropFactory.createDrop(p, vault, alignmentBps)));
@@ -75,11 +81,13 @@ contract MiyaDropLaunchTest is Test {
         assertEq(registry.factoryOf(address(d)), address(dropFactory));
 
         vm.prank(buyer);
-        d.mint{ value: 1 ether }(0, 10, new bytes32[](0));
-        d.withdraw();
+        d.mint{ value: 1 ether }(0, 10, new bytes32[](0), address(0), 0);
+        d.distribute(address(0));
+        vm.prank(artist);
+        d.withdraw(address(0));
 
         assertEq(treasury.balance, 0.01 ether, "1% protocol");
-        assertEq(UniAlignmentVault(payable(vault)).pendingETH(address(d)), 0.2 ether, "20% alignment, drop is benefactor");
+        assertEq(IAlignmentVault(payable(vault)).pendingOf(address(d), address(0)), 0.2 ether, "20% alignment, drop is benefactor");
         assertEq(artist.balance, 0.79 ether, "artist remainder");
     }
 
@@ -92,8 +100,10 @@ contract MiyaDropLaunchTest is Test {
         vm.stopPrank();
 
         vm.prank(buyer);
-        d.mint{ value: 1 ether }(0, 10, new bytes32[](0));
-        d.withdraw();
+        d.mint{ value: 1 ether }(0, 10, new bytes32[](0), address(0), 0);
+        d.distribute(address(0));
+        vm.prank(artist);
+        d.withdraw(address(0));
         assertEq(treasury.balance, 0.01 ether);
         assertEq(newTreasury.balance, 0);
         assertEq(artist.balance, 0.89 ether);
@@ -105,6 +115,7 @@ contract MiyaDropLaunchTest is Test {
         p.name = "x";
         p.symbol = "X";
         p.maxSupply = 1;
+        p.acceptedTokens = new address[](1); // ETH, so the payment check passes and the registry check is reached
         vm.expectRevert(MiyaRegistry.NotFactory.selector);
         rogue.createDrop(p, vault, 1000);
     }

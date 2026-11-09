@@ -364,4 +364,98 @@ contract MiyaRegistryTest is Test {
         vm.expectRevert(MiyaRegistry.InvalidAddress.selector);
         registry.registerInstance(address(0), makeAddr("vault"), stranger);
     }
+
+    // ── payment tokens ──────────────────────────────────────────────────────
+
+    event PaymentTokenSet(address indexed token, bool allowed);
+
+    function _codeToken(string memory name) internal returns (address t) {
+        t = makeAddr(name);
+        vm.etch(t, hex"00");
+    }
+
+    function test_paymentToken_ethAlwaysAllowed() public view {
+        assertTrue(registry.isPaymentToken(address(0)));
+        assertEq(registry.paymentTokens().length, 0);
+    }
+
+    function test_paymentToken_allowAndDrop() public {
+        address usdc = _codeToken("usdc");
+        address wbtc = _codeToken("wbtc");
+        assertFalse(registry.isPaymentToken(usdc));
+        vm.expectEmit(true, false, false, true, address(registry));
+        emit PaymentTokenSet(usdc, true);
+        vm.prank(owner);
+        registry.setPaymentToken(usdc, true);
+        vm.prank(owner);
+        registry.setPaymentToken(wbtc, true);
+        assertTrue(registry.isPaymentToken(usdc));
+        address[] memory list = registry.paymentTokens();
+        assertEq(list.length, 2);
+        assertEq(list[0], usdc);
+        assertEq(list[1], wbtc);
+
+        vm.expectEmit(true, false, false, true, address(registry));
+        emit PaymentTokenSet(usdc, false);
+        vm.prank(owner);
+        registry.setPaymentToken(usdc, false);
+        assertFalse(registry.isPaymentToken(usdc));
+        list = registry.paymentTokens();
+        assertEq(list.length, 1);
+        assertEq(list[0], wbtc);
+
+        // Setting the current value again is a no-op (no duplicate in the list).
+        vm.prank(owner);
+        registry.setPaymentToken(wbtc, true);
+        assertEq(registry.paymentTokens().length, 1);
+    }
+
+    function test_paymentToken_onlyOwnerAndValidation() public {
+        address usdc = _codeToken("usdc");
+        vm.prank(stranger);
+        vm.expectRevert(Ownable.Unauthorized.selector);
+        registry.setPaymentToken(usdc, true);
+        vm.startPrank(owner);
+        vm.expectRevert(MiyaRegistry.InvalidAddress.selector);
+        registry.setPaymentToken(address(0), false); // ETH can't be dropped
+        vm.expectRevert(MiyaRegistry.InvalidAddress.selector);
+        registry.setPaymentToken(makeAddr("eoa"), true); // no code
+        vm.stopPrank();
+    }
+
+    function testFuzz_paymentToken_listMatchesFlags(uint8[16] calldata ops) public {
+        address[4] memory toks = [_codeToken("t0"), _codeToken("t1"), _codeToken("t2"), _codeToken("t3")];
+        vm.startPrank(owner);
+        for (uint256 i; i < ops.length; ++i) {
+            registry.setPaymentToken(toks[ops[i] % 4], ops[i] & 0x80 != 0);
+        }
+        vm.stopPrank();
+        address[] memory list = registry.paymentTokens();
+        uint256 allowed;
+        for (uint256 k; k < 4; ++k) {
+            bool inList;
+            for (uint256 j; j < list.length; ++j) if (list[j] == toks[k]) inList = true;
+            assertEq(inList, registry.isPaymentToken(toks[k]));
+            if (inList) ++allowed;
+        }
+        assertEq(list.length, allowed);
+    }
+
+    function test_paymentToken_capOf15Erc20s() public {
+        // The vault holds at most 16 distinct tokens pending (ETH included): 15 ERC-20s + ETH always fit, so the cap
+        // can't be used to make a vault refuse an allowed token's cut.
+        assertEq(registry.MAX_PAYMENT_TOKENS(), 15);
+        vm.startPrank(owner);
+        for (uint256 i; i < 15; ++i) registry.setPaymentToken(_codeToken(string.concat("t", vm.toString(i))), true);
+        address extra = _codeToken("extra");
+        vm.expectRevert(MiyaRegistry.TooManyPaymentTokens.selector);
+        registry.setPaymentToken(extra, true);
+        // Re-allowing an allowed token is still a no-op, and dropping one frees a slot.
+        registry.setPaymentToken(registry.paymentTokens()[0], true);
+        registry.setPaymentToken(registry.paymentTokens()[0], false);
+        registry.setPaymentToken(extra, true);
+        vm.stopPrank();
+        assertEq(registry.paymentTokens().length, 15);
+        assertTrue(registry.isPaymentToken(extra));
+    }
 }

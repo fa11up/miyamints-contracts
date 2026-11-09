@@ -58,9 +58,12 @@ contract DynamicPricingModule is Ownable, IDynamicPricingModule {
         uint256 r = 1e18 + (priceIncreaseRate * 1e14);
         uint256 rStart = FixedPointMathLib.rpow(r, startMinted, 1e18);
         uint256 rAmount = FixedPointMathLib.rpow(r, amount, 1e18);
-        // Divide first and last by the large terms, so a small basePrice doesn't truncate to nothing on the way.
-        return FixedPointMathLib.fullMulDiv(
-            FixedPointMathLib.fullMulDiv(basePrice, rStart, r - 1e18), rAmount - 1e18, 1e18
+        // Divide first and last by the large terms, so a small basePrice doesn't truncate to nothing on the way, and
+        // round up: the buyer never pays less than the curve. Each piece costs at least basePrice.
+        uint256 cost = FixedPointMathLib.fullMulDivUp(
+            FixedPointMathLib.fullMulDivUp(basePrice, rStart, r - 1e18), rAmount - 1e18, 1e18
         );
+        uint256 least = basePrice * amount;
+        return cost < least ? least : cost;
     }
 }

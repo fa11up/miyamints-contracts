@@ -6,20 +6,14 @@
   "weth": "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14",
   "poolManager": "0xE03A1074c86CFeDd5C142C4F04F1a1536e203543",
   "zRouter": "0x000000000000FB114709235f1ccBFfb925F600e4",
-  "zRouterFee": 3000,
-  "zRouterTickSpacing": 60,
-  "v2Factory": "0xF62c03E08ada871A0bEb309762E260a7a6a880E6",
   "v3Factory": "0x0227628f3F023bb0B980b67D528571c95c6DaC1c",
   "createX": "0xba5Ed099633D3B313e4D5F7bdc1305d3c28ba5Ed",
   "permit2": "0x000000000022D473030F116dDEE9F6B43aC78BA3",
   "protocolFeeBps": 100,
   "minAlignmentBps": 1000,
-  "maxPriceDeviationBps": 500,
-  "minPoolEth": 0,
-  "twapSeconds": 1800,
   "alignmentTargetName": "Test alignment token",
   "alignmentToken": "0x0000000000000000000000000000000000000000",
   "deployMockAlignmentToken": true,
   "deployGatingModule": false,
-  "_verified": "2026-11-01 via cast code -r https://ethereum-sepolia-rpc.publicnode.com: WETH, v4 PoolManager, v3 factory, v2 factory, zRouter (Sepolia build), CreateX, Permit2 all have code. Testing only: treasury defaults to the deployer when TREASURY is unset, and with no ALIGNMENT_TOKEN a mintable test ERC20 (script/mocks/TestAlignmentToken.sol) is deployed. It has no v4 pool, so drops/mints/contributions work but convertAndAddLiquidity will not until you create and seed an ETH/token pool at 3000/60."
+  "_verified": "2026-11-01 via cast code -r https://ethereum-sepolia-rpc.publicnode.com: WETH, v4 PoolManager, v3 factory, zRouter (Sepolia build), CreateX, Permit2 all have code. Testing only: treasury defaults to the deployer when TREASURY is unset, and with no ALIGNMENT_TOKEN a mintable test ERC20 (script/mocks/TestAlignmentToken.sol) is deployed. It has no v4 pool, so drops/mints/contributions work but convertAndAddLiquidity will not until you create and seed a test INFER/IMD pool at 3000/60 and allow a swap target."
 }

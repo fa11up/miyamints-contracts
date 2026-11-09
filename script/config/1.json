@@ -6,20 +6,64 @@
   "weth": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
   "poolManager": "0x000000000004444c5dc75cB358380D2e3dE08A90",
   "zRouter": "0x000000000000FB114709235f1ccBFfb925F600e4",
-  "zRouterFee": 10000,
-  "zRouterTickSpacing": 200,
-  "v2Factory": "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f",
   "v3Factory": "0x1F98431c8aD98523631AE4a59f267346ea31F984",
   "createX": "0xba5Ed099633D3B313e4D5F7bdc1305d3c28ba5Ed",
   "permit2": "0x000000000022D473030F116dDEE9F6B43aC78BA3",
   "protocolFeeBps": 100,
   "minAlignmentBps": 1000,
-  "maxPriceDeviationBps": 500,
-  "minPoolEth": 1000000000000000000,
-  "twapSeconds": 1800,
   "alignmentTargetName": "INFER",
   "alignmentToken": "0x53d0eA0A685220718Dc6a0a6e4617194C6F37921",
+  "imd": "0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7",
+  "alignmentPool": {
+    "fee": 12500,
+    "tickSpacing": 60,
+    "hook": "0x784FF9a3ac5d88A30bfff6F7f2a270161FBE6000"
+  },
+  "ethPool": {
+    "fee": 10000,
+    "tickSpacing": 200
+  },
   "deployMockAlignmentToken": false,
   "deployGatingModule": false,
-  "_verified": "2026-11-01, block ~26,324,849: every address above has code (cast code -r https://ethereum-rpc.publicnode.com). treasury = imdUSD Treasury (25 kB). zRouter = zammdefi zRouter (README address), exposes swapV4 0x21c0dad2. INFER has no hookless native-ETH v4 pool yet (2026-11-04): seed one at fee 10000/ts 200 before deploying, or the script stops at its pool check. zRouterFee 10000 / tickSpacing 200 is factory-wide and applies to every vault this factory deploys. v2Factory = Uniswap v2 factory 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f (live). Since 2026-11-02 the validator ignores v2 pairs under MIN_V2_REFERENCE_WETH (10 ETH), so dust pairs no longer block conversion."
+  "_verified": "2026-11-01, block ~26,324,849: every address above has code (cast code -r https://ethereum-rpc.publicnode.com). treasury = imdUSD Treasury (25 kB). zRouter = zammdefi zRouter (README address, Sourcify-verified), exposes swapV4 0x21c0dad2. 2026-11-08, block ~26,374,628: 0x AllowanceHolder 0x0000000000001fF3684f28c67538d4D072C22734 has code (1,010 B). The vault needs two live v4 pools, which the script checks (initialized, liquidity in range) unless ALLOW_MISSING_POOL=true: the INFER/IMD alignment pool (alignmentPool: INFER c0 / IMD c1, fee 12500, spacing 60, hook PoolInitializationGuard, beforeInitialize only; liquidity 7.62e23 on 2026-11-08) and the hookless native-ETH/IMD pool ETH-mode claims sell IMD into (ethPool: fee 10000, spacing 200; liquidity 9.73e21).",
+  "_vaultV2": "2026-11-08: vault v2 aligns to the INFER/IMD v4 pool. Conversions run keeper-built aggregator calldata: 0x (AllowanceHolder, quotes with taker = the vault) with zRouter as the fallback the keeper builds itself; the vault only calls swapTargets (vault factory setSwapTarget, owner = the Safe), approves exactly the amount in, resets it after, and checks its own balances (input down by exactly the amount, output up by at least the keeper's non-zero floor). paymentTokens (registry allowlist, at most 15 ERC-20s), swapTargets, ethPool and minContributions (vault factory) are set by the script before the ownership handoff, per docs/IMD-INFER-VAULT.md.",
+  "paymentTokens": [
+    "0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7",
+    "0x53d0eA0A685220718Dc6a0a6e4617194C6F37921",
+    "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+    "0x61aAF8a992A3143e2B0C9cB0030b9fE702854a25",
+    "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
+    "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"
+  ],
+  "swapTargets": [
+    "0x0000000000001fF3684f28c67538d4D072C22734",
+    "0x000000000000FB114709235f1ccBFfb925F600e4"
+  ],
+  "minContributions": [
+    {
+      "amount": 1000000000000000000,
+      "token": "0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7"
+    },
+    {
+      "amount": 3500000000000000000000,
+      "token": "0x53d0eA0A685220718Dc6a0a6e4617194C6F37921"
+    },
+    {
+      "amount": 2000000,
+      "token": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+    },
+    {
+      "amount": 3000000000000000000,
+      "token": "0x61aAF8a992A3143e2B0C9cB0030b9fE702854a25"
+    },
+    {
+      "amount": 3000,
+      "token": "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"
+    },
+    {
+      "amount": 3000,
+      "token": "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"
+    }
+  ],
+  "_minContributions": "2026-11-08: least amount per ERC-20 contribution (vault factory setMinContribution), each about 0.001 ETH at spot (the vault's fixed ETH minimum): 1 ETH = 2,228 USDC = 907 IMD = 0.0294 BTC (v4 ETH/USDC, ETH/IMD, ETH/WBTC), 1 IMD = 3,887 INFER = 4.17 imdUSD (INFER/IMD, imdUSD/IMD). USDC 2 (0.0009 ETH), IMD 1 (0.0011 ETH), INFER 3,500 (0.001 ETH), imdUSD 3 (0.0008 ETH), WBTC/cbBTC 3,000 sats (0.001 ETH). Dust can't be spammed into a vault; a contribution of a new token no longer breaks a keeper call either way (subset conversion). Tokens the keeper swaps to ETH (USDC, WBTC, cbBTC) join the batch's one ETH -> IMD swap."
 }

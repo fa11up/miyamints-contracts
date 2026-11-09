@@ -41,14 +41,14 @@ contract ERC1155EditionHandler is Test {
         amount = bound(amount, 1, 10);
 
         // Check supply limit for limited editions
-        (,,, uint256 supply, uint256 minted,,,,) = instance.editions(editionId);
+        (,, uint256 supply, uint256 minted,,,,) = instance.editions(editionId);
         if (supply > 0 && minted + amount > supply) return;
 
-        uint256 cost = instance.calculateMintCost(editionId, amount);
+        uint256 cost = instance.calculateMintCost(editionId, amount, address(0));
 
         vm.deal(actor, actor.balance + cost);
         vm.prank(actor);
-        instance.mint{value: cost}(editionId, amount, bytes32(0), "", 0);
+        instance.mint{value: cost}(editionId, amount, bytes32(0), "", address(0), 0);
 
         ghost_balances[editionId][actor] += amount;
         ghost_mintCount++;

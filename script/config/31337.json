@@ -1,0 +1,51 @@
+{
+  "chainId": 31337,
+  "name": "Offline test (mock addresses)",
+  "explorer": "",
+  "treasury": "0x1000000000000000000000000000000000000008",
+  "weth": "0x1000000000000000000000000000000000000001",
+  "poolManager": "0x1000000000000000000000000000000000000002",
+  "zRouter": "0x1000000000000000000000000000000000000003",
+  "v3Factory": "0x0000000000000000000000000000000000000000",
+  "createX": "0xba5Ed099633D3B313e4D5F7bdc1305d3c28ba5Ed",
+  "protocolFeeBps": 100,
+  "minAlignmentBps": 1000,
+  "alignmentTargetName": "INFER (offline mock)",
+  "alignmentToken": "0x1000000000000000000000000000000000000005",
+  "imd": "0x1000000000000000000000000000000000000006",
+  "alignmentPool": {
+    "fee": 12500,
+    "tickSpacing": 60,
+    "hook": "0x0000000000000000000000000000000000000000"
+  },
+  "ethPool": {
+    "fee": 3000,
+    "tickSpacing": 60
+  },
+  "deployMockAlignmentToken": false,
+  "deployGatingModule": false,
+  "_offline": "Used only by test/deploy/DeployMiyamintsOffline.t.sol (chain 31337, no RPC): every address is a mock the test places with deployCodeTo / etch (0x...0004 stands in for 0x AllowanceHolder). Not a deployment config: a fresh anvil has no code at these addresses, so the script stops at its first code check.",
+  "paymentTokens": [
+    "0x1000000000000000000000000000000000000005",
+    "0x1000000000000000000000000000000000000006",
+    "0x1000000000000000000000000000000000000007"
+  ],
+  "swapTargets": [
+    "0x1000000000000000000000000000000000000004",
+    "0x1000000000000000000000000000000000000003"
+  ],
+  "minContributions": [
+    {
+      "amount": 1000000000000000000,
+      "token": "0x1000000000000000000000000000000000000006"
+    },
+    {
+      "amount": 3500000000000000000000,
+      "token": "0x1000000000000000000000000000000000000005"
+    },
+    {
+      "amount": 2000000,
+      "token": "0x1000000000000000000000000000000000000007"
+    }
+  ]
+}

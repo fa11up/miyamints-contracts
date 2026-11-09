@@ -29,6 +29,14 @@ interface IMiyaRegistry {
 
     function isFactoryRegistered(address factory) external view returns (bool);
 
+    // ── payment tokens ──────────────────────────────────────────────────────
+    /// @notice True for ETH (address(0)) and for ERC-20s the owner has allowed. Collections and vaults refuse others.
+    function isPaymentToken(address token) external view returns (bool);
+
+    function setPaymentToken(address token, bool allowed) external;
+
+    function paymentTokens() external view returns (address[] memory);
+
     // ── vaults ──────────────────────────────────────────────────────────────
     /// @notice True if `vault` was deployed by a registered vault factory.
     function isVault(address vault) external view returns (bool);

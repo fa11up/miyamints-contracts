@@ -2,7 +2,6 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
-import {LibClone} from "solady/utils/LibClone.sol";
 import {Currency} from "v4-core/types/Currency.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {IHooks} from "v4-core/interfaces/IHooks.sol";
@@ -15,15 +14,17 @@ import {ERC1155Factory} from "../../src/factories/erc1155/ERC1155Factory.sol";
 import {ERC1155Instance, InsufficientBalance} from "../../src/factories/erc1155/ERC1155Instance.sol";
 import {ERC721AuctionFactory} from "../../src/factories/erc721/ERC721AuctionFactory.sol";
 import {ERC721AuctionInstance} from "../../src/factories/erc721/ERC721AuctionInstance.sol";
+import {TokenPrice} from "../../src/factories/interfaces/TokenPrice.sol";
+import {ClaimMode, IAlignmentVault} from "../../src/interfaces/IAlignmentVault.sol";
 import {UniAlignmentVault} from "../../src/vaults/uni/UniAlignmentVault.sol";
 import {UniAlignmentVaultFactory} from "../../src/vaults/uni/UniAlignmentVaultFactory.sol";
-import {IVaultPriceValidator} from "../../src/interfaces/IVaultPriceValidator.sol";
+import {testAlignmentKey} from "../helpers/VaultV2TestKey.sol";
+import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 import {FreeMintParams} from "../../src/interfaces/IFactoryTypes.sol";
 import {GatingScope} from "../../src/gating/IGatingModule.sol";
-import {TestableUniAlignmentVault} from "../helpers/TestableUniAlignmentVault.sol";
 import {MockEXECToken} from "../mocks/MockEXECToken.sol";
 import {MockZRouter} from "../mocks/MockZRouter.sol";
-import {MockVaultPriceValidator} from "../mocks/MockVaultPriceValidator.sol";
+import {VaultTestBase} from "../vaults/VaultTestBase.sol";
 
 /// @notice End-to-end launch flow against a real MiyaRegistry: DAO adds a target, the vault factory deploys and
 ///         registers a vault, artists launch collections choosing an alignment share, and revenue splits
@@ -48,20 +49,25 @@ contract MiyaLaunchTest is Test {
 
     uint256 internal _salt;
 
+    function _ethPrice(uint256 price) internal pure returns (TokenPrice[] memory p) {
+        p = new TokenPrice[](1);
+        p[0] = TokenPrice(address(0), price);
+    }
+
     function setUp() public {
         vm.etch(CREATEX, CREATEX_BYTECODE);
         token = new MockEXECToken(1_000_000e18);
 
         registry = new MiyaRegistry(dao, treasury, PROTOCOL_BPS, MIN_ALIGNMENT_BPS);
 
+        address imdToken = address(new MockEXECToken(1_000_000e18));
         vaultFactory = new UniAlignmentVaultFactory(
-            weth,
-            makeAddr("poolManager"),
+            IMiyaRegistry(address(registry)),
+            IPoolManager(makeAddr("poolManager")),
             address(new MockZRouter()),
-            3000,
-            60,
-            IVaultPriceValidator(address(new MockVaultPriceValidator())),
-            IMiyaRegistry(address(registry))
+            address(token),
+            imdToken,
+            testAlignmentKey(address(token), imdToken)
         );
         factory1155 = new ERC1155Factory(IMiyaRegistry(address(registry)), weth);
         factory721 = new ERC721AuctionFactory(IMiyaRegistry(address(registry)), weth);
@@ -75,7 +81,7 @@ contract MiyaLaunchTest is Test {
         registry.setFactory(address(factory721), true);
         vm.stopPrank();
 
-        vault = vaultFactory.deployVault(_vaultSalt(), address(token), TARGET_ID, IVaultPriceValidator(address(0)));
+        vault = vaultFactory.deployVault(_vaultSalt(), TARGET_ID);
 
         vm.deal(artist, 100 ether);
         vm.deal(buyer, 100_000 ether);
@@ -107,7 +113,8 @@ contract MiyaLaunchTest is Test {
             alignmentBps: alignmentBps,
             styleUri: "",
             gatingModule: address(0),
-            freeMint: FreeMintParams({allocation: 0, scope: GatingScope.BOTH})
+            freeMint: FreeMintParams({allocation: 0, scope: GatingScope.BOTH}),
+            acceptedTokens: new address[](1)
         });
     }
 
@@ -122,7 +129,8 @@ contract MiyaLaunchTest is Test {
             lines: 1,
             baseDuration: 1 hours,
             timeBuffer: 5 minutes,
-            bidIncrement: 0.01 ether
+            bidIncrement: 0.01 ether,
+            currency: address(0)
         });
     }
 
@@ -130,7 +138,7 @@ contract MiyaLaunchTest is Test {
         vm.prank(artist);
         inst = ERC1155Instance(payable(factory1155.createInstance(_salt1155(), _params1155(vault, alignmentBps))));
         vm.prank(artist);
-        inst.addEdition("Piece", 1 ether, 0, "ipfs://piece", ERC1155Instance.PricingModel.UNLIMITED, 0, 0);
+        inst.addEdition("Piece", _ethPrice(1 ether), 0, "ipfs://piece", ERC1155Instance.PricingModel.UNLIMITED, 0, 0);
     }
 
     function _launch721(uint16 alignmentBps) internal returns (ERC721AuctionInstance inst) {
@@ -144,13 +152,13 @@ contract MiyaLaunchTest is Test {
         returns (uint256 toTreasury, uint256 toVault, uint256 toArtist)
     {
         vm.prank(buyer);
-        inst.mint{value: amount * 1 ether}(1, amount, bytes32(0), "", 0);
+        inst.mint{value: amount * 1 ether}(1, amount, bytes32(0), "", address(0), 0);
 
         uint256 t0 = treasuryAddr.balance;
         uint256 v0 = vault.balance;
         uint256 a0 = artist.balance;
         vm.prank(artist);
-        inst.withdraw(amount * 1 ether);
+        inst.withdraw(address(0));
         return (treasuryAddr.balance - t0, vault.balance - v0, artist.balance - a0);
     }
 
@@ -161,10 +169,10 @@ contract MiyaLaunchTest is Test {
     {
         uint256 deposit = 0.01 ether;
         vm.prank(artist);
-        inst.queuePiece{value: deposit}("ipfs://piece");
+        inst.queuePiece{value: deposit}("ipfs://piece", deposit);
         uint24 tokenId = inst.nextTokenId() - 1;
         vm.prank(buyer);
-        inst.createBid{value: bid}(tokenId, "");
+        inst.createBid{value: bid}(tokenId, bid, "");
         vm.warp(inst.getAuction(tokenId).endTime);
 
         uint256 t0 = treasuryAddr.balance;
@@ -178,7 +186,7 @@ contract MiyaLaunchTest is Test {
 
     function test_vaultFactoryRegistersVault() public view {
         assertTrue(registry.isVault(vault));
-        assertEq(UniAlignmentVault(payable(vault)).alignmentToken(), address(token));
+        assertEq(UniAlignmentVault(payable(vault)).infer(), address(token));
         assertEq(address(UniAlignmentVault(payable(vault)).registry()), address(registry));
     }
 
@@ -187,7 +195,7 @@ contract MiyaLaunchTest is Test {
         registry.setTargetActive(TARGET_ID, false);
         bytes32 salt = _vaultSalt();
         vm.expectRevert(UniAlignmentVault.TargetNotActive.selector);
-        vaultFactory.deployVault(salt, address(token), TARGET_ID, IVaultPriceValidator(address(0)));
+        vaultFactory.deployVault(salt, TARGET_ID);
     }
 
     function test_launch_registersInstanceAndSnapshotsTerms() public {
@@ -311,7 +319,7 @@ contract MiyaLaunchTest is Test {
         assertEq(t, 0.1 ether, "1% to treasury");
         assertEq(v, 1 ether, "10% to vault");
         assertEq(a, 8.9 ether, "89% to artist");
-        assertEq(UniAlignmentVault(payable(vault)).pendingETH(address(inst)), 1 ether, "instance is benefactor");
+        assertEq(IAlignmentVault(payable(vault)).pendingOf(address(inst), address(0)), 1 ether, "instance is benefactor");
     }
 
     function testFuzz_1155_split(uint16 alignmentBps, uint8 amountRaw) public {
@@ -408,7 +416,7 @@ contract MiyaLaunchTest is Test {
         registry.setTreasury(makeAddr("t2"));
 
         vm.prank(artist);
-        inst.queuePiece{value: 0.2 ether}("ipfs://unsold");
+        inst.queuePiece{value: 0.2 ether}("ipfs://unsold", 0.2 ether);
         vm.warp(inst.getAuction(1).endTime);
         uint256 t0 = treasury.balance;
         vm.prank(artist);
@@ -417,70 +425,34 @@ contract MiyaLaunchTest is Test {
     }
 }
 
-/// @notice ERC1155Instance must be able to receive vault fee payouts (UniAlignmentVault.claimFees pays the
-///         benefactor with a plain call) and forward them to the owner without disturbing mint accounting.
-contract ERC1155VaultFeeClaimTest is Test {
-    MiyaRegistry registry;
-    ERC1155Factory factory;
-    TestableUniAlignmentVault vault;
-    MockEXECToken token;
+/// @notice ERC1155Instance must receive vault v2 fee payouts (INFER and IMD, plus ETH dust) and forward them to the
+///         owner without disturbing mint accounting.
+contract ERC1155VaultFeeClaimTest is VaultTestBase {
+    ERC1155Factory factory1155;
 
     address artist = makeAddr("artist");
     address buyer = makeAddr("buyer");
-    address keeper = makeAddr("keeper");
-    address treasury = makeAddr("treasury");
 
-    function setUp() public {
-        vm.etch(CREATEX, CREATEX_BYTECODE);
-        token = new MockEXECToken(1_000_000e18);
-        registry = new MiyaRegistry(address(this), treasury, 100, 1000);
-        address[] memory tokens = new address[](1);
-        tokens[0] = address(token);
-        registry.addTarget("Remilia", tokens);
+    function _ethPrice(uint256 price) internal pure returns (TokenPrice[] memory p) {
+        p = new TokenPrice[](1);
+        p[0] = TokenPrice(address(0), price);
+    }
 
-        MockZRouter zRouter = new MockZRouter();
-        vm.deal(address(zRouter), 100 ether);
-        token.transfer(address(zRouter), 100_000e18);
-
-        // Testable vault (mock LP) owned by this test, registered with this test acting as the vault factory.
-        vault = TestableUniAlignmentVault(payable(LibClone.clone(address(new TestableUniAlignmentVault()))));
-        vault.initialize(
-            address(this),
-            makeAddr("weth"),
-            makeAddr("poolManager"),
-            address(token),
-            address(zRouter),
-            3000,
-            60,
-            IVaultPriceValidator(address(new MockVaultPriceValidator())),
-            IMiyaRegistry(address(registry)),
-            0
-        );
-        vault.setV4PoolKey(
-            PoolKey({
-                currency0: Currency.wrap(address(0)),
-                currency1: Currency.wrap(address(token)),
-                fee: 3000,
-                tickSpacing: 60,
-                hooks: IHooks(address(0))
-            })
-        );
+    function setUp() public override {
+        super.setUp();
         registry.setVaultFactory(address(this), true);
         registry.registerVault(address(vault));
-
-        factory = new ERC1155Factory(IMiyaRegistry(address(registry)), makeAddr("weth"));
-        registry.setFactory(address(factory), true);
-
+        factory1155 = new ERC1155Factory(IMiyaRegistry(address(registry)), makeAddr("weth"));
+        registry.setFactory(address(factory1155), true);
         vm.deal(buyer, 100 ether);
-        vm.deal(address(this), 100 ether);
     }
 
     function _launchAndSell() internal returns (ERC1155Instance inst) {
         vm.prank(artist);
         inst = ERC1155Instance(
             payable(
-                factory.createInstance(
-                    bytes32(abi.encodePacked(address(factory), uint8(0x00), bytes11(uint88(1)))),
+                factory1155.createInstance(
+                    bytes32(abi.encodePacked(address(factory1155), uint8(0x00), bytes11(uint88(1)))),
                     ERC1155Factory.CreateParams({
                         name: "Editions",
                         metadataURI: "ipfs://meta",
@@ -489,77 +461,90 @@ contract ERC1155VaultFeeClaimTest is Test {
                         alignmentBps: 2000,
                         styleUri: "",
                         gatingModule: address(0),
-                        freeMint: FreeMintParams({allocation: 0, scope: GatingScope.BOTH})
+                        freeMint: FreeMintParams({allocation: 0, scope: GatingScope.BOTH}),
+                        acceptedTokens: new address[](1)
                     })
                 )
             )
         );
         vm.prank(artist);
-        inst.addEdition("Piece", 1 ether, 0, "ipfs://piece", ERC1155Instance.PricingModel.UNLIMITED, 0, 0);
+        inst.addEdition("Piece", _ethPrice(1 ether), 0, "ipfs://piece", ERC1155Instance.PricingModel.UNLIMITED, 0, 0);
         vm.prank(buyer);
-        inst.mint{value: 2 ether}(1, 2, bytes32(0), "gm", 0);
+        inst.mint{value: 2 ether}(1, 2, bytes32(0), "gm", address(0), 0);
 
-        // withdraw half: 0.2 ETH (20%) becomes the instance's vault contribution
-        vm.prank(artist);
-        inst.withdraw(1 ether);
+        // split the proceeds: 0.4 ETH (20%) becomes the instance's vault contribution, 1.58 ETH is owed to the artist
+        inst.distribute(address(0));
+        assertEq(vault.pendingOf(address(inst), address(0)), 0.4 ether);
 
-        // contribution converts into benefactor shares for the instance, then the vault earns fees
-        registry.setConversionKeeper(keeper);
-        vm.prank(keeper);
-        vault.convertAndAddLiquidity(1, 1);
-        assertGt(vault.benefactorShares(address(inst)), 0);
-        vault.depositFees{value: 3 ether}();
+        // the contribution converts into shares for the instance, then the position earns INFER and IMD
+        _convert();
+        assertGt(vault.getBenefactorShares(address(inst)), 0);
+        vault.accrueFees(100e18, 200e18); // INFER, IMD
+        vault.collectFees();
     }
 
     function test_claimVaultFees_forwardsVaultPayoutToOwner() public {
         ERC1155Instance inst = _launchAndSell();
 
-        uint256 artistBefore = artist.balance;
-        uint256 instBefore = address(inst).balance;
         vm.prank(artist);
-        uint256 claimed = inst.claimVaultFees();
+        (uint256 inferOut, uint256 imdOut,) = inst.claimVaultFees(ClaimMode.TOKENS, 0);
 
-        assertGt(claimed, 0);
-        assertApproxEqAbs(claimed, 3 ether, 1, "sole benefactor gets all fees");
-        assertEq(artist.balance - artistBefore, claimed, "owner receives claimed fees");
-        assertEq(address(inst).balance, instBefore, "nothing stranded in the instance");
+        // sole benefactor gets all fees less the 1% protocol cut
+        assertApproxEqAbs(inferOut, 99e18, 1e6);
+        assertApproxEqAbs(imdOut, 198e18, 1e6);
+        assertEq(infer.balanceOf(artist), inferOut, "owner receives INFER");
+        assertEq(imd.balanceOf(artist), imdOut, "owner receives IMD");
+        assertEq(infer.balanceOf(address(inst)), 0, "nothing stranded");
+        assertEq(imd.balanceOf(address(inst)), 0, "nothing stranded");
 
-        // mint accounting is untouched: the remaining 1 ETH of proceeds is still exactly withdrawable
-        assertEq(inst.totalProceeds() - inst.totalWithdrawn(), 1 ether);
-        assertEq(inst.pendingVaultCut(), 0);
+        // mint accounting is untouched: the artist's 1.58 ETH is still exactly what withdraw pays
+        assertEq(inst.ownerBalance(address(0)), 1.58 ether);
+        assertEq(inst.unsplitProceeds(address(0)), 0);
+        assertEq(inst.pendingVaultCut(address(0)), 0);
+        uint256 artistBefore = artist.balance;
+        vm.prank(artist);
+        inst.withdraw(address(0));
+        assertEq(artist.balance - artistBefore, 1.58 ether);
         vm.prank(artist);
         vm.expectRevert(InsufficientBalance.selector);
-        inst.withdraw(1 ether + 1);
-        vm.prank(artist);
-        inst.withdraw(1 ether);
+        inst.withdraw(address(0));
     }
 
     function test_claimAllFees_forwardsVaultPayoutToOwner() public {
         ERC1155Instance inst = _launchAndSell();
-        uint256 artistBefore = artist.balance;
         vm.prank(artist);
         inst.claimAllFees();
-        assertApproxEqAbs(artist.balance - artistBefore, 3 ether, 1);
+        assertApproxEqAbs(infer.balanceOf(artist), 99e18, 1e6);
+        assertApproxEqAbs(imd.balanceOf(artist), 198e18, 1e6);
     }
 
     function test_receivedEthIsNotWithdrawableAsProceeds() public {
         ERC1155Instance inst = _launchAndSell();
-        // plain ETH sent to the instance (e.g. a vault payout) never counts as mint proceeds
+        // plain ETH sent to the instance (e.g. vault ETH dust) never counts as mint proceeds
+        vm.deal(address(this), 5 ether);
         (bool ok,) = address(inst).call{value: 5 ether}("");
         assertTrue(ok);
-        assertEq(inst.totalProceeds() - inst.totalWithdrawn(), 1 ether);
-        assertEq(inst.pendingVaultCut(), 0);
+        assertEq(inst.unsplitProceeds(address(0)), 0);
+        assertEq(inst.ownerBalance(address(0)), 1.58 ether);
+        uint256 artistBefore = artist.balance;
         vm.prank(artist);
-        vm.expectRevert(InsufficientBalance.selector);
-        inst.withdraw(2 ether);
+        inst.withdraw(address(0));
+        assertEq(artist.balance - artistBefore, 1.58 ether, "the stray 5 ETH stays out until swept");
     }
 
     function test_claimVaultFees_onlyOwner() public {
         ERC1155Instance inst = _launchAndSell();
         vm.prank(buyer);
         vm.expectRevert();
-        inst.claimVaultFees();
+        inst.claimVaultFees(ClaimMode.TOKENS, 0);
     }
 
-    receive() external payable {}
+    function test_claimVaultFees_nothingToClaimReverts() public {
+        ERC1155Instance inst = _launchAndSell();
+        vm.prank(artist);
+        inst.claimVaultFees(ClaimMode.TOKENS, 0);
+        vm.prank(artist);
+        vm.expectRevert();
+        inst.claimVaultFees(ClaimMode.TOKENS, 0);
+    }
 }

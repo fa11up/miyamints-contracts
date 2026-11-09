@@ -8,11 +8,12 @@ import {MiyaRegistry} from "../../../src/registry/MiyaRegistry.sol";
 import {IMiyaRegistry} from "../../../src/registry/interfaces/IMiyaRegistry.sol";
 import {FreeMintParams} from "../../../src/interfaces/IFactoryTypes.sol";
 import {GatingScope} from "../../../src/gating/IGatingModule.sol";
-import {FreeMintDisabled, FreeMintAlreadyClaimed, FreeMintExhausted, EditionNotOpen, EditionNotFound, LengthMismatch, RenounceDisabled} from "../../../src/factories/erc1155/ERC1155Instance.sol";
+import {FreeMintDisabled, FreeMintAlreadyClaimed, FreeMintExhausted, EditionNotOpen, EditionNotFound, LengthMismatch, RenounceDisabled, OnlyFactory, AlreadyInitialized, Unauthorized} from "../../../src/factories/erc1155/ERC1155Instance.sol";
 import {MiyaPool} from "../../../src/pools/MiyaPool.sol";
 import {MiyaPoolFactory} from "../../../src/pools/MiyaPoolFactory.sol";
 import {ICreateX, CREATEX} from "../../../src/shared/CreateXConstants.sol";
 import {CREATEX_BYTECODE} from "createx-forge/script/CreateX.d.sol";
+import {TokenPrice} from "../../../src/factories/interfaces/TokenPrice.sol";
 
 contract MockVaultERC1155FM {
     function supportsCapability(bytes32) external pure returns (bool) { return true; }
@@ -36,6 +37,11 @@ contract ERC1155FreeMintTest is Test {
     function _nextSalt() internal returns (bytes32) {
         _saltCounter++;
         return bytes32(abi.encodePacked(address(factory), uint8(0x00), bytes11(uint88(_saltCounter))));
+    }
+
+    function _eth(uint256 price) internal pure returns (TokenPrice[] memory p) {
+        p = new TokenPrice[](1);
+        p[0] = TokenPrice(address(0), price);
     }
 
     function setUp() public {
@@ -63,7 +69,8 @@ contract ERC1155FreeMintTest is Test {
                 alignmentBps: 1900,
                 styleUri: "",
                 gatingModule: address(0),
-                freeMint: FreeMintParams({allocation: alloc, scope: scope})
+                freeMint: FreeMintParams({allocation: alloc, scope: scope}),
+                acceptedTokens: new address[](1)
             })
         );
         vm.stopPrank();
@@ -73,7 +80,7 @@ contract ERC1155FreeMintTest is Test {
     function _addEdition(ERC1155Instance inst, uint256 supply) internal returns (uint256 editionId) {
         vm.prank(creator);
         inst.addEdition(
-            "Piece 1", 0.01 ether, supply, "ipfs://edition",
+            "Piece 1", _eth(0.01 ether), supply, "ipfs://edition",
             ERC1155Instance.PricingModel.LIMITED_FIXED, 0, 0
         );
         return inst.nextEditionId() - 1;
@@ -135,7 +142,7 @@ contract ERC1155FreeMintTest is Test {
         uint256 openAt = block.timestamp + 1 days;
         vm.prank(creator);
         inst.addEdition(
-            "Timed", 0.01 ether, 100, "ipfs://timed", ERC1155Instance.PricingModel.LIMITED_FIXED, 0, openAt
+            "Timed", _eth(0.01 ether), 100, "ipfs://timed", ERC1155Instance.PricingModel.LIMITED_FIXED, 0, openAt
         );
         uint256 editionId = inst.nextEditionId() - 1;
 
@@ -210,5 +217,68 @@ contract ERC1155FreeMintTest is Test {
         vm.prank(creator);
         vm.expectRevert(RenounceDisabled.selector);
         inst.renounceOwnership();
+    }
+
+    // ── initializeFreeMint (direct calls) ─────────────────────────────────────
+
+    function test_erc1155_initializeFreeMint_directFromFactory_setsParams() public {
+        address fakeFactory = makeAddr("fakeFactory");
+        ERC1155Instance inst = new ERC1155Instance(
+            "Direct", creator, fakeFactory, address(mockVault), "",
+            ERC1155Instance.InstanceInit({
+                protocolTreasury: makeAddr("treasury"),
+                protocolFeeBps: 100,
+                alignmentBps: 1900,
+                gatingModule: address(0),
+                dynamicPricingModule: address(0),
+                weth: address(0xBEEF),
+                registry: address(registry),
+                acceptedTokens: new address[](1)
+            })
+        );
+        assertEq(inst.freeMintAllocation(), 0);
+
+        vm.prank(fakeFactory);
+        inst.initializeFreeMint(7, GatingScope.PAID_ONLY);
+        assertEq(inst.freeMintAllocation(), 7);
+        assertEq(uint8(inst.gatingScope()), uint8(GatingScope.PAID_ONLY));
+
+        // Second call, even from the factory, reverts.
+        vm.prank(fakeFactory);
+        vm.expectRevert(AlreadyInitialized.selector);
+        inst.initializeFreeMint(9, GatingScope.BOTH);
+    }
+
+    function test_erc1155_initializeFreeMint_revertsForNonFactory() public {
+        ERC1155Instance inst = _deploy(FREE_ALLOC, GatingScope.BOTH);
+        vm.prank(creator);
+        vm.expectRevert(OnlyFactory.selector);
+        inst.initializeFreeMint(100, GatingScope.FREE_MINT_ONLY);
+        assertEq(inst.freeMintAllocation(), FREE_ALLOC);
+    }
+
+    function test_erc1155_initializeFreeMint_revertsAfterFactoryCreation() public {
+        ERC1155Instance inst = _deploy(FREE_ALLOC, GatingScope.BOTH);
+        // The factory already called initializeFreeMint inside createInstance.
+        vm.prank(address(factory));
+        vm.expectRevert(AlreadyInitialized.selector);
+        inst.initializeFreeMint(100, GatingScope.FREE_MINT_ONLY);
+    }
+
+    // ── setStyle ──────────────────────────────────────────────────────────────
+
+    function test_erc1155_setStyle_ownerSetsStyleUri() public {
+        ERC1155Instance inst = _deploy(FREE_ALLOC, GatingScope.BOTH);
+        vm.prank(creator);
+        inst.setStyle("ipfs://style");
+        assertEq(inst.styleUri(), "ipfs://style");
+    }
+
+    function test_erc1155_setStyle_revertsForNonOwner() public {
+        ERC1155Instance inst = _deploy(FREE_ALLOC, GatingScope.BOTH);
+        vm.prank(user1);
+        vm.expectRevert(Unauthorized.selector);
+        inst.setStyle("ipfs://evil");
+        assertEq(inst.styleUri(), "");
     }
 }

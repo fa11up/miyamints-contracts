@@ -2,11 +2,10 @@
 src = "src"
 out = "out"
 libs = ["lib"]
-# Compiler is auto-detected but capped at 0.8.28, so every source resolves to 0.8.28 except the one test that
-# imports v4-core's real PoolManager (pinned `=0.8.26`): test/vaults/UniAlignmentVaultRealV4.t.sol and its
-# imports compile as a separate 0.8.26 unit. Production artifacts are still built with 0.8.28.
-auto_detect_solc = true
-compilation_restrictions = [{ paths = "**", max_version = "0.8.28" }]
+# Production compiler, pinned: src, script and every test in test/ build with solc 0.8.28 (no auto-detect, so an
+# installed 0.8.30 can't sneak in).
+solc_version = "0.8.28"
+auto_detect_solc = false
 optimizer = true
 optimizer_runs = 100
 via_ir = true
@@ -27,14 +26,15 @@ remappings = [
 [profile.deploy]
 fs_permissions = [{ access = "read-write", path = "./deployments/" }, { access = "read", path = "./script/config/" }]
 
-# Fast local iteration: `FOUNDRY_PROFILE=lite forge test`
-[profile.lite]
-via_ir = false
-optimizer = false
+# No `lite` (via_ir = false) profile: without via_ir, UniAlignmentVault does not compile (stack too deep), checked
+# 2026-11-08 with forge 1.9. via_ir stays on in every profile.
 
-[profile.ci]
-fuzz_runs = 1000
-invariant_runs = 10000
+# `FOUNDRY_PROFILE=ci forge test` (forge 1.9 ignores the old flat fuzz_runs / invariant_runs keys)
+[profile.ci.fuzz]
+runs = 1000
+
+[profile.ci.invariant]
+runs = 10000
 
 [fmt]
 line_length = 120

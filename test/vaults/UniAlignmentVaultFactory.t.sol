@@ -1,293 +1,194 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.24;
 
-import { Ownable } from "solady/auth/Ownable.sol";
-import "forge-std/Test.sol";
-import "../../src/vaults/uni/UniAlignmentVaultFactory.sol";
-import {UniAlignmentVault} from "../../src/vaults/uni/UniAlignmentVault.sol";
-import {IVaultPriceValidator} from "../../src/interfaces/IVaultPriceValidator.sol";
-import {IMiyaRegistry} from "../../src/registry/interfaces/IMiyaRegistry.sol";
-import {MockZRouter} from "../mocks/MockZRouter.sol";
-import {MockVaultPriceValidator} from "../mocks/MockVaultPriceValidator.sol";
-import {MiyaRegistry} from "../../src/registry/MiyaRegistry.sol";
-import {MockEXECToken} from "../mocks/MockEXECToken.sol";
-import {CREATEX} from "../../src/shared/CreateXConstants.sol";
-import {CREATEX_BYTECODE} from "createx-forge/script/CreateX.d.sol";
+import {Ownable} from "solady/auth/Ownable.sol";
 import {Currency} from "v4-core/types/Currency.sol";
+import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {IHooks} from "v4-core/interfaces/IHooks.sol";
+import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
+import {UniAlignmentVault} from "../../src/vaults/uni/UniAlignmentVault.sol";
+import {UniAlignmentVaultFactory} from "../../src/vaults/uni/UniAlignmentVaultFactory.sol";
+import {IMiyaRegistry} from "../../src/registry/interfaces/IMiyaRegistry.sol";
+import {MiyaRegistry} from "../../src/registry/MiyaRegistry.sol";
+import {VaultTestBase} from "./VaultTestBase.sol";
+import {ClaimMode} from "../../src/interfaces/IAlignmentVault.sol";
+import {IzRouter} from "../../src/vaults/uni/IVaultConfig.sol";
 
-contract UniAlignmentVaultFactoryTest is Test {
-    UniAlignmentVaultFactory public factory;
-    MockEXECToken public alignmentToken;
-    MiyaRegistry public registry;
+contract UniAlignmentVaultFactoryTest is VaultTestBase {
+    event SwapTargetSet(address indexed target, bool allowed);
+    event EthPoolSet(uint24 fee, int24 tickSpacing);
+    event VaultDeployed(address indexed vault, uint256 indexed alignmentTargetId);
 
-    address public owner;
-    address public mockPoolManager;
-    address public mockWeth;
-
-    MockZRouter public mockZRouter;
-    MockVaultPriceValidator public mockPriceValidator;
-
-    uint256 internal _saltCounter;
-
-    uint256 constant TARGET_ID = 0;
-
-    event VaultDeployed(address indexed vault, address indexed alignmentToken);
-
-    function _nextSalt() internal returns (bytes32) {
-        _saltCounter++;
-        return bytes32(abi.encodePacked(address(factory), uint8(0x00), bytes11(uint88(_saltCounter))));
+    function _salt(bytes11 tag) internal view returns (bytes32) {
+        return bytes32(abi.encodePacked(address(factory), bytes1(0x00), tag));
     }
 
-    function setUp() public {
-        vm.etch(CREATEX, CREATEX_BYTECODE);
-        owner = address(this);
-        mockPoolManager = makeAddr("poolManager");
-        mockWeth = makeAddr("weth");
+    // ── deployVault ─────────────────────────────────────────────────────────
 
-        alignmentToken = new MockEXECToken(1000000e18);
-
-        mockZRouter = new MockZRouter();
-        mockPriceValidator = new MockVaultPriceValidator();
-        registry = new MiyaRegistry(address(this), address(0xFEE), 100, 1000);
-        address[] memory targetTokens = new address[](1);
-        targetTokens[0] = address(alignmentToken);
-        registry.addTarget("Test target", targetTokens);
-
-        factory = new UniAlignmentVaultFactory(
-            mockWeth,
-            mockPoolManager,
-            address(mockZRouter),
-            3000,
-            60,
-            IVaultPriceValidator(address(mockPriceValidator)),
-            IMiyaRegistry(address(registry))
-        );
-        registry.setVaultFactory(address(factory), true);
-    }
-
-    function test_deployVault_ownerOnly() public {
-        bytes32 salt = _nextSalt();
-        vm.prank(makeAddr("stranger"));
-        vm.expectRevert(Ownable.Unauthorized.selector);
-        factory.deployVault(salt, address(alignmentToken), TARGET_ID, IVaultPriceValidator(address(0)));
-    }
-
-    function test_deployVault_setsAlignmentToken() public {
-        address vault = factory.deployVault(
-            _nextSalt(),
-            address(alignmentToken),
-            TARGET_ID,
-            IVaultPriceValidator(address(0))
-        );
-
-        assertEq(UniAlignmentVault(payable(vault)).alignmentToken(), address(alignmentToken));
-    }
-
-    function test_deployVault_usesFactoryZRouterConfig() public {
-        address vault = factory.deployVault(
-            _nextSalt(),
-            address(alignmentToken),
-            TARGET_ID,
-            IVaultPriceValidator(address(0))
-        );
-
-        assertEq(UniAlignmentVault(payable(vault)).zRouter(), factory.zRouter(), "Should use factory zRouter");
-        assertEq(UniAlignmentVault(payable(vault)).zRouterFee(), factory.zRouterFee(), "Should use factory fee");
-        assertEq(UniAlignmentVault(payable(vault)).zRouterTickSpacing(), factory.zRouterTickSpacing(), "Should use factory tickSpacing");
-        assertEq(
-            address(UniAlignmentVault(payable(vault)).priceValidator()),
-            address(factory.defaultPriceValidator()),
-            "Should use default price validator"
-        );
-    }
-
-    function test_deployVault_acceptsCustomPriceValidator() public {
-        MockVaultPriceValidator customValidator = new MockVaultPriceValidator();
-
-        address vault = factory.deployVault(
-            _nextSalt(),
-            address(alignmentToken),
-            TARGET_ID,
-            IVaultPriceValidator(address(customValidator))
-        );
-
-        assertEq(
-            address(UniAlignmentVault(payable(vault)).priceValidator()),
-            address(customValidator),
-            "Should use custom price validator"
-        );
-    }
-
-    function test_deployVault_differentInstancesAreIndependent() public {
-        MockEXECToken token2 = new MockEXECToken(1000000e18);
-        address[] memory t2 = new address[](1);
-        t2[0] = address(token2);
-        uint256 target2 = registry.addTarget("Second target", t2);
-
-        address vault1 = factory.deployVault(
-            _nextSalt(),
-            address(alignmentToken),
-            TARGET_ID,
-            IVaultPriceValidator(address(0))
-        );
-
-        address vault2 = factory.deployVault(
-            _nextSalt(),
-            address(token2),
-            target2,
-            IVaultPriceValidator(address(0))
-        );
-
-        assertTrue(vault1 != vault2, "Vaults should be different addresses");
-        assertEq(UniAlignmentVault(payable(vault1)).alignmentToken(), address(alignmentToken));
-        assertEq(UniAlignmentVault(payable(vault2)).alignmentToken(), address(token2));
-    }
-
-    function test_deployVault_emitsVaultDeployed() public {
-        vm.expectEmit(false, true, false, false);
-        emit VaultDeployed(address(0), address(alignmentToken));
-
-        factory.deployVault(
-            _nextSalt(),
-            address(alignmentToken),
-            TARGET_ID,
-            IVaultPriceValidator(address(0))
-        );
-    }
-
-    function test_deployVault_revertsWhenTokenNotInTarget() public {
-        address rogueToken = address(0xBAD);
-
-        vm.expectRevert(UniAlignmentVault.TokenNotInTarget.selector);
-        factory.deployVault(
-            _nextSalt(),
-            rogueToken,
-            TARGET_ID,
-            IVaultPriceValidator(address(0))
-        );
-    }
-
-    function test_deployVault_revertsWhenTargetNotActive() public {
-        registry.setTargetActive(TARGET_ID, false);
-
-        vm.expectRevert(UniAlignmentVault.TargetNotActive.selector);
-        factory.deployVault(
-            _nextSalt(),
-            address(alignmentToken),
-            TARGET_ID,
-            IVaultPriceValidator(address(0))
-        );
-    }
-
-    function test_constructor_storesAddresses() public view {
-        assertEq(factory.weth(), mockWeth);
-        assertEq(factory.poolManager(), mockPoolManager);
-        assertEq(factory.zRouter(), address(mockZRouter));
-        assertEq(factory.zRouterFee(), 3000);
-        assertEq(factory.zRouterTickSpacing(), 60);
-        assertEq(address(factory.defaultPriceValidator()), address(mockPriceValidator));
-        assertEq(address(factory.registry()), address(registry));
-        assertTrue(factory.vaultImplementation() != address(0));
-    }
-
-    // ── MiyaRegistry vault registration ─────────────────────────────────────
-
-    function test_deployVault_registersVaultInRegistry() public {
-        address vault = factory.deployVault(
-            _nextSalt(), address(alignmentToken), TARGET_ID, IVaultPriceValidator(address(0))
-        );
-        assertTrue(registry.isVault(vault), "vault should be registered");
-        assertFalse(registry.isVault(address(0xdead)));
-    }
-
-    function test_deployVault_emitsVaultRegistered() public {
-        bytes32 salt = _nextSalt();
+    function test_deployVault_configuresAndRegisters() public {
+        bytes32 salt = _salt(bytes11("v1"));
         address predicted = factory.computeVaultAddress(salt);
-        vm.expectEmit(true, true, false, false, address(registry));
-        emit MiyaRegistry.VaultRegistered(predicted, address(factory));
-        factory.deployVault(salt, address(alignmentToken), TARGET_ID, IVaultPriceValidator(address(0)));
+        UniAlignmentVault v = UniAlignmentVault(payable(factory.deployVault(salt, 0)));
+        assertEq(address(v), predicted);
+        assertTrue(registry.isVault(address(v)));
+        assertEq(v.owner(), address(factory));
+        assertEq(address(v.poolManager()), POOL_MANAGER);
+        assertEq(v.zRouter(), address(router));
+        assertEq(address(v.registry()), address(registry));
+        assertEq(address(v.config()), address(factory));
+        assertEq(v.infer(), INFER_ADDR);
+        assertEq(v.imd(), IMD_ADDR);
+        assertEq(v.alignmentTargetId(), 0);
+        PoolKey memory k = v.alignmentPoolKey();
+        assertEq(Currency.unwrap(k.currency0), INFER_ADDR);
+        assertEq(Currency.unwrap(k.currency1), IMD_ADDR);
+        assertEq(k.fee, 12500);
+        assertEq(k.tickSpacing, 60);
+        assertEq(address(k.hooks), HOOK);
+        assertEq(v.protocolTreasury(), treasury);
     }
 
-    function test_deployVault_revertsWhenFactoryNotRegistered() public {
-        registry.setVaultFactory(address(factory), false);
-        bytes32 salt = _nextSalt();
-        vm.expectRevert(MiyaRegistry.NotVaultFactory.selector);
-        factory.deployVault(salt, address(alignmentToken), TARGET_ID, IVaultPriceValidator(address(0)));
-    }
-
-    // ── Audit M4: pool key fixed at deploy, hookless, never repointable ──
-
-    function test_deployVault_setsHooklessPoolKeyOnce() public {
-        address vault = factory.deployVault(
-            _nextSalt(), address(alignmentToken), TARGET_ID, IVaultPriceValidator(address(0))
-        );
-        (Currency c0, Currency c1, uint24 fee, int24 tickSpacing, IHooks hooks) =
-            UniAlignmentVault(payable(vault)).v4PoolKey();
-        assertEq(Currency.unwrap(c0), address(0));
-        assertEq(Currency.unwrap(c1), address(alignmentToken));
-        assertEq(fee, 3000);
-        assertEq(tickSpacing, 60);
-        assertEq(address(hooks), address(0));
-        UniAlignmentVault(payable(vault)).validateCurrentPoolKey();
-    }
-
-    function test_poolKeyCannotBeRepointed() public {
-        address vault = factory.deployVault(
-            _nextSalt(), address(alignmentToken), TARGET_ID, IVaultPriceValidator(address(0))
-        );
-        PoolKey memory other = PoolKey({
-            currency0: Currency.wrap(address(0)),
-            currency1: Currency.wrap(address(alignmentToken)),
-            fee: 10000,
-            tickSpacing: 200,
-            hooks: IHooks(address(0))
-        });
-        // Factory owner has no passthrough, and calling the vault directly is not the vault owner.
+    function test_deployVault_onlyOwner() public {
+        bytes32 salt = _salt(bytes11("v1"));
+        vm.prank(alice);
         vm.expectRevert(Ownable.Unauthorized.selector);
-        UniAlignmentVault(payable(vault)).setV4PoolKey(other);
-        // Even the vault owner (the factory) cannot change it after deploy.
-        vm.prank(address(factory));
-        vm.expectRevert(UniAlignmentVault.PoolKeyAlreadySet.selector);
-        UniAlignmentVault(payable(vault)).setV4PoolKey(other);
+        factory.deployVault(salt, 0);
     }
 
-    function test_saltNotBoundToFactoryIsRefused() public {
-        bytes32 unbound = keccak256("vault-2");
+    function test_deployVault_saltMustBeBoundToFactory() public {
         vm.expectRevert(UniAlignmentVaultFactory.InvalidVaultSalt.selector);
-        factory.deployVault(unbound, address(alignmentToken), TARGET_ID, IVaultPriceValidator(address(0)));
+        factory.deployVault(bytes32(uint256(1)), 0);
+        bytes32 bad = bytes32(abi.encodePacked(address(factory), bytes1(0x01), bytes11("x")));
         vm.expectRevert(UniAlignmentVaultFactory.InvalidVaultSalt.selector);
-        factory.computeVaultAddress(unbound);
+        factory.computeVaultAddress(bad);
     }
 
-    function test_saltWithChainFlagIsRefused() public {
-        bytes32 flagged = bytes32(abi.encodePacked(address(factory), uint8(0x01), bytes11(uint88(1))));
-        vm.expectRevert(UniAlignmentVaultFactory.InvalidVaultSalt.selector);
-        factory.computeVaultAddress(flagged);
+    function test_deployVault_needsRegistration() public {
+        registry.setVaultFactory(address(factory), false);
+        bytes32 salt = _salt(bytes11("v1"));
+        vm.expectRevert(MiyaRegistry.NotVaultFactory.selector);
+        factory.deployVault(salt, 0);
     }
 
-    function test_previewMatchesDeployment() public {
-        bytes32 salt = _nextSalt();
-        address preview = factory.computeVaultAddress(salt);
-        address vault = factory.deployVault(salt, address(alignmentToken), TARGET_ID, IVaultPriceValidator(address(0)));
-        assertEq(vault, preview);
+    function test_deployVault_badPoolKeyReverts() public {
+        PoolKey memory k = key;
+        k.hooks = IHooks(address(0x1000000000000000000000000000000000000040)); // afterSwap
+        UniAlignmentVaultFactory f = new UniAlignmentVaultFactory(
+            IMiyaRegistry(address(registry)), IPoolManager(POOL_MANAGER), address(router), INFER_ADDR, IMD_ADDR, k
+        );
+        registry.setVaultFactory(address(f), true);
+        bytes32 salt = bytes32(abi.encodePacked(address(f), bytes1(0x00), bytes11("v")));
+        vm.expectRevert(UniAlignmentVault.InvalidPoolKey.selector);
+        f.deployVault(salt, 0);
     }
 
-    function test_implementationCannotBeClaimed() public {
+    function test_implementation_cannotBeInitialized() public {
         UniAlignmentVault impl = UniAlignmentVault(payable(factory.vaultImplementation()));
-        vm.prank(makeAddr("stranger"));
-        vm.expectRevert();
-        impl.initialize(
-            makeAddr("stranger"),
-            address(1),
-            address(2),
-            address(alignmentToken),
-            address(3),
-            3000,
-            60,
-            IVaultPriceValidator(address(0)),
-            IMiyaRegistry(address(registry)),
-            TARGET_ID
+        vm.expectRevert(Ownable.AlreadyInitialized.selector);
+        impl.disableInitializer();
+    }
+
+    function test_vaults_shareTheConfig() public {
+        UniAlignmentVault v1 = UniAlignmentVault(payable(factory.deployVault(_salt(bytes11("a")), 0)));
+        UniAlignmentVault v2 = UniAlignmentVault(payable(factory.deployVault(_salt(bytes11("b")), 0)));
+        assertEq(address(v1.config()), address(v2.config()));
+        assertTrue(factory.isSwapTarget(address(router)));
+    }
+
+    // ── swap targets ────────────────────────────────────────────────────────
+
+    function test_setSwapTarget_allowAndRemove() public {
+        address agg = address(new MiyaRegistry(address(this), treasury, 0, 0)); // any contract
+        assertFalse(factory.isSwapTarget(agg));
+        vm.expectEmit(true, false, false, true, address(factory));
+        emit SwapTargetSet(agg, true);
+        factory.setSwapTarget(agg, true);
+        assertTrue(factory.isSwapTarget(agg));
+        vm.expectEmit(true, false, false, true, address(factory));
+        emit SwapTargetSet(agg, false);
+        factory.setSwapTarget(agg, false);
+        assertFalse(factory.isSwapTarget(agg));
+    }
+
+    function test_setSwapTarget_onlyOwner() public {
+        vm.prank(keeper); // the keeper can't add targets
+        vm.expectRevert(Ownable.Unauthorized.selector);
+        factory.setSwapTarget(address(router), true);
+        vm.prank(alice);
+        vm.expectRevert(Ownable.Unauthorized.selector);
+        factory.setSwapTarget(address(router), false);
+    }
+
+    function test_setSwapTarget_refusesEoasAndVaultInternals() public {
+        address[6] memory bad = [alice, address(0), INFER_ADDR, IMD_ADDR, address(registry), address(factory)];
+        for (uint256 i; i < bad.length; ++i) {
+            vm.expectRevert(UniAlignmentVaultFactory.InvalidAddress.selector);
+            factory.setSwapTarget(bad[i], true);
+        }
+        // The PoolManager, once it has code.
+        vm.etch(POOL_MANAGER, hex"00");
+        vm.expectRevert(UniAlignmentVaultFactory.InvalidAddress.selector);
+        factory.setSwapTarget(POOL_MANAGER, true);
+        // Removing is always possible (an EOA was never allowed, so this is a no-op).
+        factory.setSwapTarget(alice, false);
+    }
+
+    // ── ETH-claim pool ──────────────────────────────────────────────────────
+
+    function test_ethPool_defaultAndSet() public {
+        (uint24 fee, int24 ts) = factory.ethPool();
+        assertEq(fee, 10000);
+        assertEq(ts, 200);
+        vm.expectEmit(false, false, false, true, address(factory));
+        emit EthPoolSet(3000, 60);
+        factory.setEthPool(3000, 60);
+        (fee, ts) = factory.ethPool();
+        assertEq(fee, 3000);
+        assertEq(ts, 60);
+        vm.expectRevert(UniAlignmentVaultFactory.InvalidPool.selector);
+        factory.setEthPool(0x800000, 60); // dynamic fee
+        vm.expectRevert(UniAlignmentVaultFactory.InvalidPool.selector);
+        factory.setEthPool(3000, 0);
+        vm.prank(alice);
+        vm.expectRevert(Ownable.Unauthorized.selector);
+        factory.setEthPool(500, 10);
+    }
+
+    function test_ethPool_usedByEthClaims() public {
+        _contributeEth(alice, 1 ether);
+        _convert();
+        vault.accrueFees(0, 100e18);
+        vault.collectFees();
+        factory.setEthPool(3000, 60);
+        (uint256 inferOwed, uint256 imdOwed,) = vault.claimable(alice);
+        assertEq(inferOwed, 0);
+        // The claim sells its IMD through zRouter.swapV4 on the factory's pool, read live.
+        vm.expectCall(
+            address(router),
+            abi.encodeCall(IzRouter.swapV4, (address(vault), false, 3000, 60, IMD_ADDR, ETH, imdOwed, 0, block.timestamp))
+        );
+        vm.prank(alice);
+        (,, uint256 ethOut) = vault.claimFees(ClaimMode.ETH, 1);
+        assertEq(alice.balance, ethOut);
+        assertEq(ethOut, imdOwed * R_IMD_ETH / 1e18);
+    }
+
+    function test_minContribution_ownerSet() public {
+        assertEq(factory.minContribution(USDC_ADDR), 0);
+        vm.expectEmit(true, false, false, true, address(factory));
+        emit UniAlignmentVaultFactory.MinContributionSet(USDC_ADDR, 3e6);
+        factory.setMinContribution(USDC_ADDR, 3e6);
+        assertEq(factory.minContribution(USDC_ADDR), 3e6);
+    }
+
+    function test_constructor_zeroAddresses() public {
+        vm.expectRevert(UniAlignmentVaultFactory.InvalidAddress.selector);
+        new UniAlignmentVaultFactory(
+            IMiyaRegistry(address(0)), IPoolManager(POOL_MANAGER), address(router), INFER_ADDR, IMD_ADDR, key
+        );
+        vm.expectRevert(UniAlignmentVaultFactory.InvalidAddress.selector);
+        new UniAlignmentVaultFactory(
+            IMiyaRegistry(address(registry)), IPoolManager(POOL_MANAGER), address(0), INFER_ADDR, IMD_ADDR, key
         );
     }
 }

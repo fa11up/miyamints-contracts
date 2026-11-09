@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {StdInvariant} from "forge-std/StdInvariant.sol";
 import {ERC1155Instance} from "../../src/factories/erc1155/ERC1155Instance.sol";
 import {ERC1155EditionHandler} from "./handlers/ERC1155EditionHandler.sol";
+import {TokenPrice} from "../../src/factories/interfaces/TokenPrice.sol";
 
 contract MockAlignmentVault {
     receive() external payable {}
@@ -23,6 +24,11 @@ contract ERC1155EditionInvariantTest is StdInvariant, Test {
 
     uint256 constant EDITION_SUPPLY = 100;
 
+    function _eth(uint256 price) internal pure returns (TokenPrice[] memory p) {
+        p = new TokenPrice[](1);
+        p[0] = TokenPrice(address(0), price);
+    }
+
     function setUp() public {
         mockVault = address(new MockAlignmentVault());
 
@@ -40,14 +46,16 @@ contract ERC1155EditionInvariantTest is StdInvariant, Test {
                 alignmentBps: 1900,
                 gatingModule: address(0),
                 dynamicPricingModule: address(0),
-                weth: address(0xBEEF)
+                weth: address(0xBEEF),
+                registry: address(0x4E61), // ETH only: never consulted
+                acceptedTokens: new address[](1)
             })
         );
 
         // Add a limited edition (supply = 100)
         instance.addEdition(
             "Limited Piece",
-            0.01 ether,
+            _eth(0.01 ether),
             EDITION_SUPPLY,
             "ipfs://limited",
             ERC1155Instance.PricingModel.LIMITED_FIXED,
@@ -58,7 +66,7 @@ contract ERC1155EditionInvariantTest is StdInvariant, Test {
         // Add an unlimited edition
         instance.addEdition(
             "Open Piece",
-            0.005 ether,
+            _eth(0.005 ether),
             0,
             "ipfs://open",
             ERC1155Instance.PricingModel.UNLIMITED,
@@ -83,7 +91,7 @@ contract ERC1155EditionInvariantTest is StdInvariant, Test {
     function invariant_mintedNeverExceedsMaxSupply() public view {
         uint256 editionCount = instance.nextEditionId() - 1;
         for (uint256 i = 1; i <= editionCount; i++) {
-            (,, , uint256 supply, uint256 minted,,,,) = instance.editions(i);
+            (,, uint256 supply, uint256 minted,,,,) = instance.editions(i);
             if (supply > 0) {
                 assertLe(
                     minted,
@@ -101,7 +109,7 @@ contract ERC1155EditionInvariantTest is StdInvariant, Test {
         address[] memory actorList = handler.getActors();
 
         for (uint256 i = 1; i <= editionCount; i++) {
-            (,,, , uint256 minted,,,,) = instance.editions(i);
+            (,,, uint256 minted,,,,) = instance.editions(i);
 
             uint256 balanceSum = 0;
             for (uint256 j = 0; j < actorList.length; j++) {

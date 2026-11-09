@@ -169,6 +169,34 @@ contract UniswapVaultPriceValidatorTest is Test {
         validator.validatePrice(TOKEN, 1 ether);
     }
 
+    // ── quoteEthForTokens (view; never reverts, so the failure cases return 0) ──
+
+    function test_quoteEthForTokens_zeroAmountReturnsZero() public view {
+        assertEq(validator.quoteEthForTokens(TOKEN, 0), 0);
+    }
+
+    /// V2 only: 30 WETH against 60 tokens, so 1 token = 0.5 WETH.
+    function test_quoteEthForTokens_usesV2SpotWhenNoV3() public {
+        v2.set(address(new MockV2Pair(TOKEN, WETH, 60e18, 30e18)));
+        assertEq(validator.quoteEthForTokens(TOKEN, 4e18), 2e18);
+    }
+
+    /// A deep V3 pool at tick 0 (sqrtPrice = 2^96, price exactly 1e18) wins over a disagreeing V2 pair.
+    function test_quoteEthForTokens_prefersV3Twap() public {
+        v2.set(address(new MockV2Pair(TOKEN, WETH, 60e18, 30e18)));
+        _v3At(1e30, 0, 100e18);
+        assertEq(validator.quoteEthForTokens(TOKEN, 3e18), 3e18);
+    }
+
+    function test_quoteEthForTokens_noPoolsReturnsZero() public {
+        v2.set(address(0));
+        assertEq(validator.quoteEthForTokens(TOKEN, 1e18), 0);
+        // Factories without code are also treated as "no pool".
+        UniswapVaultPriceValidator bare =
+            new UniswapVaultPriceValidator(WETH, address(0xA1), address(0xA2), address(new EmptyPoolManager()), 500, 1800);
+        assertEq(bare.quoteEthForTokens(TOKEN, 1e18), 0);
+    }
+
     /// A share of value, so the answer can't depend on the token's raw price. Fuzzes across real price ranges.
     function testFuzz_fullRangeProportionIsHalfAtAnyPrice(int24 tick) public {
         tick = int24(bound(tick, -400_000, 400_000));

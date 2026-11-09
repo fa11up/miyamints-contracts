@@ -7,7 +7,6 @@ import { Ownable } from "solady/auth/Ownable.sol";
 import { LibString } from "solady/utils/LibString.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { StateLibrary } from "v4-core/libraries/StateLibrary.sol";
-import { FullMath } from "v4-core/libraries/FullMath.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
 import { PoolId, PoolIdLibrary } from "v4-core/types/PoolId.sol";
 import { Currency } from "v4-core/types/Currency.sol";
@@ -16,8 +15,6 @@ import { IHooks } from "v4-core/interfaces/IHooks.sol";
 import { ICreateX, CREATEX } from "../src/shared/CreateXConstants.sol";
 import { MiyaRegistry } from "../src/registry/MiyaRegistry.sol";
 import { IMiyaRegistry } from "../src/registry/interfaces/IMiyaRegistry.sol";
-import { UniswapVaultPriceValidator } from "../src/peripherals/UniswapVaultPriceValidator.sol";
-import { IVaultPriceValidator } from "../src/interfaces/IVaultPriceValidator.sol";
 import { UniAlignmentVault } from "../src/vaults/uni/UniAlignmentVault.sol";
 import { UniAlignmentVaultFactory } from "../src/vaults/uni/UniAlignmentVaultFactory.sol";
 import { ERC721DropFactory } from "../src/factories/erc721drop/ERC721DropFactory.sol";
@@ -34,12 +31,13 @@ import { TestAlignmentToken } from "./mocks/TestAlignmentToken.sol";
  *         included) for the chain the RPC points at. Per-chain external addresses come from
  *         script/config/<chainId>.json; a few values can be overridden by env (see DEPLOY.md).
  *
- *         Order: [test token] → MiyaRegistry → UniswapVaultPriceValidator → UniAlignmentVaultFactory →
- *         ERC721DropFactory → ERC721AuctionFactory → ERC1155Factory → DynamicPricingModule → [gating module] →
- *         MiyaPoolFactory → registry wiring → default alignment target + vault → ownership handoff → checks → JSON.
+ *         Order: [test token] → MiyaRegistry → UniAlignmentVaultFactory → ERC721DropFactory → ERC721AuctionFactory →
+ *         ERC1155Factory → DynamicPricingModule → [gating module] → MiyaPoolFactory → registry wiring → payment tokens,
+ *         swap targets, ETH-claim pool and minimums → default alignment target + vault → ownership handoff → checks →
+ *         JSON.
  *
- *         Addressing: contracts that take their owner as an argument or have none (registry, price validator,
- *         drop factory, pool factory) are deployed with CreateX CREATE3 and a deployer-permissioned salt, so the
+ *         Addressing: contracts that take their owner as an argument or have none (registry, drop factory, pool
+ *         factory) are deployed with CreateX CREATE3 and a deployer-permissioned salt, so the
  *         same deployer + SALT_NAMESPACE gives the same addresses on every chain (MiyaPoolFactory relies on that
  *         for cross-chain pool addresses). Contracts whose constructor sets `owner = msg.sender` (vault factory,
  *         1155/auction factories, modules) use plain CREATE from the deployer, because under CREATE3 the owner
@@ -61,30 +59,32 @@ contract DeployMiyamints is Script {
         address owner; // final owner of the registry and Ownable factories/modules
         address weth;
         address poolManager;
-        address zRouter;
-        uint24 zRouterFee;
-        int24 zRouterTickSpacing;
-        address v2Factory;
+        address zRouter; // ETH-mode claims sell IMD through it; also the keeper's fallback swap target
         address v3Factory;
         address createX;
         uint16 protocolFeeBps;
         uint16 minAlignmentBps;
-        uint256 maxPriceDeviationBps;
-        uint256 minPoolEth; // wei of virtual ETH depth the alignment pool must have
-        uint32 twapSeconds;
         string alignmentTargetName;
-        address alignmentToken;
+        address alignmentToken; // INFER: the alignment pool's other side and the registry target token
+        address imd; // vault v2 converts every payment token to IMD and pairs it with INFER
+        uint24 alignmentPoolFee; // the INFER/IMD v4 pool the vaults provide liquidity to
+        int24 alignmentPoolTickSpacing;
+        address alignmentPoolHook;
+        uint24 ethPoolFee; // the hookless ETH/IMD v4 pool ETH-mode claims swap through (vault factory setEthPool)
+        int24 ethPoolTickSpacing;
+        address[] swapTargets; // contracts the keeper's conversion calldata may call (0x AllowanceHolder, zRouter)
         address keeper;
         bool deployMockAlignmentToken;
         bool deployGatingModule;
         bool allowMissingPool;
         string saltNamespace;
+        string gitCommit; // DEPLOY_GIT_COMMIT, set by script/deploy.sh after it checks the checkout
+        string gitRef; // DEPLOY_GIT_REF: "main" or the tag deployed
     }
 
     struct Deployment {
         address deployer;
         address registry;
-        address priceValidator;
         address vaultFactory;
         address vaultImplementation;
         address dropFactory;
@@ -106,6 +106,7 @@ contract DeployMiyamints is Script {
     /// @notice Broadcast with --account / --ledger / --private-key (or DEPLOYER_PRIVATE_KEY if set).
     function run() external returns (Deployment memory d) {
         Config memory cfg = loadConfig();
+        _requireReleaseCheckout(cfg);
         if (vm.envExists("DEPLOYER_PRIVATE_KEY")) {
             vm.startBroadcast(vm.envUint("DEPLOYER_PRIVATE_KEY"));
         } else {
@@ -126,6 +127,7 @@ contract DeployMiyamints is Script {
     function runAs(address deployer, address owner) public returns (Deployment memory d) {
         Config memory cfg = loadConfig();
         if (owner != address(0)) cfg.owner = owner;
+        _requireReleaseCheckout(cfg);
         vm.startBroadcast(deployer);
         d = _deployAll(cfg, deployer);
         vm.stopBroadcast();
@@ -149,23 +151,34 @@ contract DeployMiyamints is Script {
         c.weth = vm.parseJsonAddress(json, ".weth");
         c.poolManager = vm.parseJsonAddress(json, ".poolManager");
         c.zRouter = vm.parseJsonAddress(json, ".zRouter");
-        c.zRouterFee = uint24(vm.parseJsonUint(json, ".zRouterFee"));
-        c.zRouterTickSpacing = int24(vm.parseJsonInt(json, ".zRouterTickSpacing"));
-        c.v2Factory = vm.parseJsonAddress(json, ".v2Factory");
         c.v3Factory = vm.parseJsonAddress(json, ".v3Factory");
         c.createX = vm.parseJsonAddress(json, ".createX");
         c.protocolFeeBps = uint16(vm.envOr("PROTOCOL_FEE_BPS", vm.parseJsonUint(json, ".protocolFeeBps")));
         c.minAlignmentBps = uint16(vm.envOr("MIN_ALIGNMENT_BPS", vm.parseJsonUint(json, ".minAlignmentBps")));
-        c.maxPriceDeviationBps = vm.parseJsonUint(json, ".maxPriceDeviationBps");
-        c.twapSeconds = uint32(vm.parseJsonUint(json, ".twapSeconds"));
-        c.minPoolEth = vm.envOr("MIN_POOL_ETH", vm.parseJsonUint(json, ".minPoolEth"));
         c.alignmentTargetName = vm.envOr("ALIGNMENT_TARGET_NAME", vm.parseJsonString(json, ".alignmentTargetName"));
         c.alignmentToken = vm.envOr("ALIGNMENT_TOKEN", vm.parseJsonAddress(json, ".alignmentToken"));
+        c.imd = vm.keyExistsJson(json, ".imd") ? vm.parseJsonAddress(json, ".imd") : address(0);
+        if (vm.keyExistsJson(json, ".alignmentPool")) {
+            c.alignmentPoolFee = uint24(vm.parseJsonUint(json, ".alignmentPool.fee"));
+            c.alignmentPoolTickSpacing = int24(vm.parseJsonInt(json, ".alignmentPool.tickSpacing"));
+            c.alignmentPoolHook = vm.parseJsonAddress(json, ".alignmentPool.hook");
+        } else {
+            (c.alignmentPoolFee, c.alignmentPoolTickSpacing) = (3000, 60); // test-token chains: hookless 0.3%
+        }
+        if (vm.keyExistsJson(json, ".ethPool")) {
+            c.ethPoolFee = uint24(vm.parseJsonUint(json, ".ethPool.fee"));
+            c.ethPoolTickSpacing = int24(vm.parseJsonInt(json, ".ethPool.tickSpacing"));
+        } else {
+            (c.ethPoolFee, c.ethPoolTickSpacing) = (10000, 200); // the vault factory's default
+        }
+        if (vm.keyExistsJson(json, ".swapTargets")) c.swapTargets = vm.parseJsonAddressArray(json, ".swapTargets");
         c.keeper = vm.envOr("KEEPER", address(0));
         c.deployMockAlignmentToken = vm.parseJsonBool(json, ".deployMockAlignmentToken");
         c.deployGatingModule = vm.envOr("DEPLOY_GATING_MODULE", vm.parseJsonBool(json, ".deployGatingModule"));
         c.allowMissingPool = vm.envOr("ALLOW_MISSING_POOL", c.deployMockAlignmentToken);
         c.saltNamespace = vm.envOr("SALT_NAMESPACE", string("miyamints.v1"));
+        c.gitCommit = vm.envOr("DEPLOY_GIT_COMMIT", string(""));
+        c.gitRef = vm.envOr("DEPLOY_GIT_REF", string(""));
 
         if (c.createX != CREATEX) revert ConfigError("createX must be the canonical CreateX the factories hardcode");
         if (c.protocolFeeBps > 500) revert ConfigError("protocolFeeBps > MAX_PROTOCOL_FEE_BPS (500)");
@@ -175,13 +188,32 @@ contract DeployMiyamints is Script {
         _requireCode(c.zRouter, "zRouter");
         _requireCode(c.createX, "createX");
         if (c.v3Factory != address(0)) _requireCode(c.v3Factory, "v3Factory");
-        if (c.v2Factory != address(0)) _requireCode(c.v2Factory, "v2Factory");
         if (c.alignmentToken != address(0)) _requireCode(c.alignmentToken, "alignmentToken");
         if (c.alignmentToken == address(0) && !c.deployMockAlignmentToken) {
             revert ConfigError("alignmentToken unset: set ALIGNMENT_TOKEN");
         }
+        if (c.imd != address(0)) _requireCode(c.imd, "imd");
+        for (uint256 i; i < c.swapTargets.length; ++i) {
+            _requireCode(c.swapTargets[i], string.concat("swapTargets[", i.toString(), "]"));
+        }
+        if (c.imd == address(0) && !c.deployMockAlignmentToken) {
+            revert ConfigError("imd unset: vault v2 needs the INFER/IMD alignment pool config (mainnet only for now)");
+        }
         if (c.treasury == address(0) && !c.deployMockAlignmentToken) {
             revert ConfigError("treasury unset for this chain: set TREASURY (a Safe/treasury you control here)");
+        }
+    }
+
+    /// @dev A broadcast must come from script/deploy.sh, which refuses unless the checkout is a clean main (or an
+    ///      explicit tag) and passes the commit it checked, so deployments/<chainId>.json records exactly what was
+    ///      deployed. Dry runs and tests are not gated.
+    function _requireReleaseCheckout(Config memory c) internal view {
+        bool live = vm.isContext(VmSafe.ForgeContext.ScriptBroadcast) || vm.isContext(VmSafe.ForgeContext.ScriptResume);
+        if (!live) return;
+        if (bytes(c.gitCommit).length != 40 || bytes(c.gitRef).length == 0) {
+            revert ConfigError(
+                "broadcast only through script/deploy.sh (clean checkout of main or a release tag; sets DEPLOY_GIT_COMMIT)"
+            );
         }
     }
 
@@ -203,7 +235,20 @@ contract DeployMiyamints is Script {
             d.alignmentToken = address(new TestAlignmentToken(deployer, 1_000_000_000e18));
             c.alignmentToken = d.alignmentToken;
         }
-        if (!c.allowMissingPool) _requirePool(c);
+        if (c.imd == address(0)) c.imd = address(new TestAlignmentToken(deployer, 1_000_000_000e18));
+        if (c.allowMissingPool) {
+            if (block.chainid == 1 || block.chainid == 4663) {
+                console2.log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+                console2.log("!! WARNING: ALLOW_MISSING_POOL=true. The pools were NOT checked: the INFER/IMD alignment");
+                console2.log("!! pool (alignmentPool: fee, tickSpacing, hook) and the ETH/IMD pool ETH claims use");
+                console2.log("!! (ethPool). Without a live INFER/IMD pool the default vault can never convert; without");
+                console2.log("!! the ETH/IMD pool, claims taken as ETH revert (TOKENS claims still work).");
+                console2.log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+            }
+        } else {
+            _requirePool(c, _alignmentKey(c), "INFER/IMD alignment pool (alignmentPool)");
+            _requirePool(c, _ethPoolKey(c), "ETH/IMD pool for ETH claims (ethPool)");
+        }
 
         // 1. Registry, owned by the deployer until wiring is done.
         d.registry = _create3(
@@ -216,26 +261,11 @@ contract DeployMiyamints is Script {
         );
         MiyaRegistry registry = MiyaRegistry(d.registry);
 
-        // 2. Price validator (ownerless).
-        d.priceValidator = _create3(
-            deployer,
-            c.saltNamespace,
-            "UniswapVaultPriceValidator",
-            abi.encodePacked(
-                type(UniswapVaultPriceValidator).creationCode,
-                abi.encode(c.weth, c.v2Factory, c.v3Factory, c.poolManager, c.maxPriceDeviationBps, c.twapSeconds)
-            )
-        );
-
-        // 3. Vault factory (Ownable(msg.sender) → CREATE). Deploys its own vault implementation.
+        // 2. Vault factory (Ownable(msg.sender) → CREATE). Deploys its own vault implementation.
+        // Payment tokens, swap targets, the ETH-claim pool and per-token minimums come from config (`paymentTokens`,
+        // `swapTargets`, `ethPool`, `minContributions`) in step 9b, before the handoff.
         UniAlignmentVaultFactory vaultFactory = new UniAlignmentVaultFactory(
-            c.weth,
-            c.poolManager,
-            c.zRouter,
-            c.zRouterFee,
-            c.zRouterTickSpacing,
-            IVaultPriceValidator(d.priceValidator),
-            IMiyaRegistry(d.registry)
+            IMiyaRegistry(d.registry), IPoolManager(c.poolManager), c.zRouter, c.alignmentToken, c.imd, _alignmentKey(c)
         );
         d.vaultFactory = address(vaultFactory);
         d.vaultImplementation = vaultFactory.vaultImplementation();
@@ -269,17 +299,21 @@ contract DeployMiyamints is Script {
         if (d.gatingModule != address(0)) registry.setComponent(d.gatingModule, true);
         erc1155Factory.setDynamicPricingModule(d.dynamicPricingModule);
 
+        // 9b. Payment-token allowlist (registry); swap targets, the ETH-claim pool and per-token contribution minimums
+        //     (vault factory), per docs/IMD-INFER-VAULT.md. ETH is always allowed.
+        _wirePayments(c, registry, vaultFactory);
+
         // 10. Default alignment target + vault (VITE_MUSIC_VAULT_<chainId>).
-        address[] memory tokens = new address[](1);
+        address[] memory tokens = new address[](2);
         tokens[0] = d.alignmentToken;
+        tokens[1] = c.imd;
         d.alignmentTargetId = registry.addTarget(c.alignmentTargetName, tokens);
         bytes32 vaultSalt = bytes32(
             abi.encodePacked(
                 d.vaultFactory, bytes1(0x00), bytes11(keccak256(abi.encodePacked(c.saltNamespace, "defaultVault")))
             )
         );
-        d.defaultVault =
-            vaultFactory.deployVault(vaultSalt, d.alignmentToken, d.alignmentTargetId, IVaultPriceValidator(address(0)));
+        d.defaultVault = vaultFactory.deployVault(vaultSalt, d.alignmentTargetId);
 
         // 11. Ownership handoff (one-step solady transferOwnership; the Safe needs no acceptance tx).
         if (c.owner != deployer) {
@@ -312,31 +346,24 @@ contract DeployMiyamints is Script {
         _t(r.isTokenInTarget(d.alignmentTargetId, d.alignmentToken), "token in target");
         _t(r.isVault(d.defaultVault), "default vault registered");
 
-        UniswapVaultPriceValidator pv = UniswapVaultPriceValidator(d.priceValidator);
-        _eq(pv.weth(), c.weth, "validator.weth");
-        _eq(pv.poolManager(), c.poolManager, "validator.poolManager");
-        _eq(pv.v3Factory(), c.v3Factory, "validator.v3Factory");
-        _t(pv.maxPriceDeviationBps() == c.maxPriceDeviationBps, "validator.maxPriceDeviationBps");
-
         UniAlignmentVaultFactory vf = UniAlignmentVaultFactory(d.vaultFactory);
         _eq(vf.owner(), c.owner, "vaultFactory.owner");
         _eq(address(vf.registry()), d.registry, "vaultFactory.registry");
-        _eq(vf.weth(), c.weth, "vaultFactory.weth");
-        _eq(vf.poolManager(), c.poolManager, "vaultFactory.poolManager");
+        _eq(address(vf.poolManager()), c.poolManager, "vaultFactory.poolManager");
         _eq(vf.zRouter(), c.zRouter, "vaultFactory.zRouter");
-        _t(vf.zRouterFee() == c.zRouterFee && vf.zRouterTickSpacing() == c.zRouterTickSpacing, "vaultFactory fee tier");
-        _eq(address(vf.defaultPriceValidator()), d.priceValidator, "vaultFactory.validator");
+        _eq(vf.infer(), d.alignmentToken, "vaultFactory.infer");
+        _eq(vf.imd(), c.imd, "vaultFactory.imd");
 
         UniAlignmentVault v = UniAlignmentVault(payable(d.defaultVault));
         _eq(v.owner(), d.vaultFactory, "vault.owner");
-        _eq(v.alignmentToken(), d.alignmentToken, "vault.alignmentToken");
+        _eq(v.infer(), d.alignmentToken, "vault.infer");
+        _eq(v.imd(), c.imd, "vault.imd");
         _eq(address(v.registry()), d.registry, "vault.registry");
+        _eq(address(v.config()), d.vaultFactory, "vault.config");
         _eq(v.protocolTreasury(), c.treasury, "vault.protocolTreasury");
-        _eq(address(v.priceValidator()), d.priceValidator, "vault.priceValidator");
-        (Currency c0, Currency c1, uint24 fee, int24 ts, IHooks hooks) = v.v4PoolKey();
-        _t(Currency.unwrap(c0) == address(0) && Currency.unwrap(c1) == d.alignmentToken, "vault pool currencies");
-        _t(fee == c.zRouterFee && ts == c.zRouterTickSpacing && address(hooks) == address(0), "vault pool tier");
-        v.validateCurrentPoolKey();
+        PoolKey memory vk = v.alignmentPoolKey();
+        PoolKey memory ek = _alignmentKey(c);
+        _t(PoolId.unwrap(vk.toId()) == PoolId.unwrap(ek.toId()), "vault alignment pool key");
 
         ERC1155Factory f1155 = ERC1155Factory(d.erc1155Factory);
         _eq(f1155.owner(), c.owner, "1155.owner");
@@ -355,6 +382,76 @@ contract DeployMiyamints is Script {
 
         _eq(Ownable(d.dynamicPricingModule).owner(), c.owner, "dynamicPricing.owner");
         _t(d.poolFactory.code.length > 0, "pool factory code");
+        _checkPayments(c, d);
+    }
+
+    // ── payment tokens, swap targets, pools ─────────────────────────────────
+
+    /// @dev JSON keys in alphabetical order, as vm.parseJson decodes struct fields.
+    struct ConfigMin {
+        uint256 amount;
+        address token;
+    }
+
+    function _configMins(string memory json) internal view returns (ConfigMin[] memory mins) {
+        if (!vm.keyExistsJson(json, ".minContributions")) return mins;
+        mins = abi.decode(vm.parseJson(json, ".minContributions"), (ConfigMin[]));
+    }
+
+    function _configJson() internal view returns (string memory) {
+        return vm.readFile(vm.envOr("MIYAMINTS_CONFIG", configPath(block.chainid)));
+    }
+
+    function _wirePayments(Config memory c, MiyaRegistry registry, UniAlignmentVaultFactory vaultFactory) internal {
+        string memory json = _configJson();
+        if (vm.keyExistsJson(json, ".paymentTokens")) {
+            address[] memory toks = vm.parseJsonAddressArray(json, ".paymentTokens");
+            for (uint256 i; i < toks.length; ++i) registry.setPaymentToken(toks[i], true);
+        }
+        for (uint256 i; i < c.swapTargets.length; ++i) vaultFactory.setSwapTarget(c.swapTargets[i], true);
+        vaultFactory.setEthPool(c.ethPoolFee, c.ethPoolTickSpacing);
+        ConfigMin[] memory mins = _configMins(json);
+        for (uint256 i; i < mins.length; ++i) vaultFactory.setMinContribution(mins[i].token, mins[i].amount);
+    }
+
+    /// @dev Every configured payment token is allowed, every configured swap target is allowed, the ETH-claim pool is
+    ///      the configured one, every configured minimum is set (an allowed token without one is flagged: it would take
+    ///      dust), and both pools the vault uses are live on the PoolManager (unless ALLOW_MISSING_POOL). Each check
+    ///      runs on its own: a missing config key skips only the checks that need it.
+    function _checkPayments(Config memory c, Deployment memory d) internal view {
+        string memory json = _configJson();
+        MiyaRegistry r = MiyaRegistry(d.registry);
+        UniAlignmentVaultFactory vf = UniAlignmentVaultFactory(d.vaultFactory);
+        address[] memory toks;
+        if (vm.keyExistsJson(json, ".paymentTokens")) toks = vm.parseJsonAddressArray(json, ".paymentTokens");
+        for (uint256 i; i < toks.length; ++i) _t(r.isPaymentToken(toks[i]), "payment token allowed");
+
+        for (uint256 i; i < c.swapTargets.length; ++i) _t(vf.isSwapTarget(c.swapTargets[i]), "swap target allowed");
+        if (c.swapTargets.length == 0) _loud("swapTargets is empty: the keeper has no swap target, so only ETH-free IMD/INFER batches can convert");
+        (uint24 fee, int24 ts) = vf.ethPool();
+        _t(fee == c.ethPoolFee && ts == c.ethPoolTickSpacing, "vault factory ethPool");
+
+        ConfigMin[] memory mins = _configMins(json);
+        for (uint256 i; i < mins.length; ++i) {
+            _t(vf.minContribution(mins[i].token) == mins[i].amount, "min contribution set");
+        }
+        if (mins.length != 0) {
+            for (uint256 i; i < toks.length; ++i) _t(vf.minContribution(toks[i]) != 0, "payment token has a minimum");
+        }
+
+        if (!c.allowMissingPool) {
+            _requirePool(c, _alignmentKey(c), "INFER/IMD alignment pool (alignmentPool)");
+            _requirePool(c, _ethPoolKey(c), "ETH/IMD pool for ETH claims (ethPool)");
+        }
+        if (MiyaRegistry(d.registry).conversionKeeper() == address(0)) {
+            _loud("KEEPER is unset: conversions are paused until the owner calls registry.setConversionKeeper");
+        }
+    }
+
+    function _loud(string memory what) internal pure {
+        console2.log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+        console2.log(string.concat("!! WARNING: ", what));
+        console2.log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
     }
 
     // ── output ──────────────────────────────────────────────────────────────
@@ -366,7 +463,6 @@ contract DeployMiyamints is Script {
 
         console2.log("== miyamints deployed on %s (chain %s) ==", c.name, id);
         console2.log("MiyaRegistry              ", d.registry);
-        console2.log("UniswapVaultPriceValidator", d.priceValidator);
         console2.log("UniAlignmentVaultFactory  ", d.vaultFactory);
         console2.log("  vault implementation    ", d.vaultImplementation);
         console2.log("ERC721DropFactory         ", d.dropFactory);
@@ -380,6 +476,7 @@ contract DeployMiyamints is Script {
         console2.log("  alignment target id     ", d.alignmentTargetId);
         console2.log("treasury                  ", c.treasury);
         console2.log("owner                     ", c.owner);
+        console2.log("conversion keeper         ", c.keeper);
         if (c.owner == d.deployer) {
             console2.log("");
             console2.log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
@@ -418,7 +515,6 @@ contract DeployMiyamints is Script {
         vm.serializeAddress(k, "owner", c.owner);
         vm.serializeAddress(k, "treasury", c.treasury);
         vm.serializeAddress(k, "registry", d.registry);
-        vm.serializeAddress(k, "priceValidator", d.priceValidator);
         vm.serializeAddress(k, "vaultFactory", d.vaultFactory);
         vm.serializeAddress(k, "vaultImplementation", d.vaultImplementation);
         vm.serializeAddress(k, "erc721DropFactory", d.dropFactory);
@@ -433,8 +529,10 @@ contract DeployMiyamints is Script {
         vm.serializeAddress(k, "weth", c.weth);
         vm.serializeAddress(k, "poolManager", c.poolManager);
         vm.serializeAddress(k, "zRouter", c.zRouter);
-        vm.serializeUint(k, "zRouterFee", c.zRouterFee);
         vm.serializeString(k, "saltNamespace", c.saltNamespace);
+        // What was deployed: the commit script/deploy.sh checked ("" on a dry run outside it).
+        vm.serializeString(k, "gitCommit", c.gitCommit);
+        vm.serializeString(k, "gitRef", c.gitRef);
         out = vm.serializeUint(k, "protocolFeeBps", c.protocolFeeBps);
     }
 
@@ -457,24 +555,50 @@ contract DeployMiyamints is Script {
         if (deployed != predicted) revert CheckFailed(string.concat(label, " CREATE3 address mismatch"));
     }
 
-    function _requirePool(Config memory c) internal view {
-        PoolKey memory key = PoolKey({
+    /// @dev The INFER/IMD alignment pool (sorted currencies), as configured.
+    function _alignmentKey(Config memory c) internal pure returns (PoolKey memory key) {
+        (address a, address b) = c.alignmentToken < c.imd ? (c.alignmentToken, c.imd) : (c.imd, c.alignmentToken);
+        key = PoolKey({
+            currency0: Currency.wrap(a),
+            currency1: Currency.wrap(b),
+            fee: c.alignmentPoolFee,
+            tickSpacing: c.alignmentPoolTickSpacing,
+            hooks: IHooks(c.alignmentPoolHook)
+        });
+    }
+
+    /// @dev The hookless native-ETH/IMD pool ETH-mode claims sell IMD into, as configured.
+    function _ethPoolKey(Config memory c) internal pure returns (PoolKey memory) {
+        return PoolKey({
             currency0: Currency.wrap(address(0)),
-            currency1: Currency.wrap(c.alignmentToken),
-            fee: c.zRouterFee,
-            tickSpacing: c.zRouterTickSpacing,
+            currency1: Currency.wrap(c.imd),
+            fee: c.ethPoolFee,
+            tickSpacing: c.ethPoolTickSpacing,
             hooks: IHooks(address(0))
         });
+    }
+
+    /// @dev `key` is initialized on the PoolManager with liquidity in range (read through extsload); prints both for a
+    ///      human to compare with the market.
+    function _requirePool(Config memory c, PoolKey memory key, string memory what) internal view {
         PoolId id = key.toId();
         (uint160 sqrtPriceX96,,,) = IPoolManager(c.poolManager).getSlot0(id);
-        if (sqrtPriceX96 == 0) revert ConfigError("no hookless native-ETH v4 pool for alignmentToken at zRouterFee");
+        if (sqrtPriceX96 == 0) {
+            revert ConfigError(
+                string.concat(
+                    what,
+                    " not initialized at fee ",
+                    uint256(key.fee).toString(),
+                    " / tickSpacing ",
+                    uint256(int256(key.tickSpacing)).toString(),
+                    ". ALLOW_MISSING_POOL=true to deploy anyway"
+                )
+            );
+        }
         uint128 liquidity = IPoolManager(c.poolManager).getLiquidity(id);
-        // Anyone can initialize an unseeded pool at any price. This is depth at the current price, which a narrow position
-        // reaches cheaply, so it only stops an unseeded or dust pool. Print what a human has to compare against the market.
-        uint256 virtualEth = FullMath.mulDiv(liquidity, 1 << 96, sqrtPriceX96);
-        if (virtualEth < c.minPoolEth) revert ConfigError("alignmentToken v4 pool is shallower than minPoolEth");
-        console2.log("alignment pool: virtual ETH (wei)", virtualEth);
-        console2.log("alignment pool: sqrtPriceX96; compare with the market before you broadcast", uint256(sqrtPriceX96));
+        if (liquidity == 0) revert ConfigError(string.concat(what, " has no liquidity in range"));
+        console2.log(string.concat(what, ": in-range liquidity"), uint256(liquidity));
+        console2.log(string.concat(what, ": sqrtPriceX96; compare with the market"), uint256(sqrtPriceX96));
     }
 
     function _requireCode(address a, string memory what) internal view {

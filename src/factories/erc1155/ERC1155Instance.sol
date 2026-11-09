@@ -3,15 +3,15 @@ pragma solidity ^0.8.24;
 
 import { Ownable } from "solady/auth/Ownable.sol";
 import { ReentrancyGuard } from "solady/utils/ReentrancyGuard.sol";
-import { SafeTransferLib } from "solady/utils/SafeTransferLib.sol";
 import { SmartTransferLib } from "../../libraries/SmartTransferLib.sol";
+import { PaymentLib } from "../../libraries/PaymentLib.sol";
 import {IDynamicPricingModule} from "./interfaces/IDynamicPricingModule.sol";
-import { IAlignmentVault } from "../../interfaces/IAlignmentVault.sol";
+import { IAlignmentVault, ClaimMode } from "../../interfaces/IAlignmentVault.sol";
+import { TokenPrice } from "../interfaces/TokenPrice.sol";
 import {IGatingModule, GatingScope} from "../../gating/IGatingModule.sol";
 
 // ── Free mint errors ─────────────────────────────────────────────────────────
 error FreeMintDisabled();
-error NoPendingProtocolCut();
 error FreeMintAlreadyClaimed();
 error FreeMintExhausted();
 
@@ -33,8 +33,6 @@ error UnlimitedMustHaveZeroSupply();
 error LimitedMustHavePositiveSupply();
 error DynamicPricingRequiresIncreaseRate();
 error EditionLimitReached();
-error NoFeesToClaim();
-error NoPendingVaultCut();
 error LengthMismatch();
 error GatingCheckFailed();
 error ERC1155RejectedTokens();
@@ -43,15 +41,21 @@ error OnlyFactory();
 error AlreadyInitialized();
 error InvalidSplit();
 error RenounceDisabled();
-import { Currency } from "v4-core/types/Currency.sol";
+error TokenNotPriced();
+error WrongPayment();
 import { RevenueSplitLib } from "../../shared/libraries/RevenueSplitLib.sol";
 import { IInstanceLifecycle, TYPE_ERC1155, STATE_MINTING } from "../../interfaces/IInstanceLifecycle.sol";
 
 /**
  * @title ERC1155Instance
  * @notice ERC1155 token instance for open edition artists
- * @dev Supports unlimited/limited editions with fixed or dynamic pricing, mint messages, and a withdraw split
+ * @dev Supports unlimited/limited editions with fixed or dynamic pricing, mint messages, and a split
  *      (protocol / alignment vault / artist) whose terms are snapshotted at launch.
+ *
+ *      Payment tokens: the owner keeps an `acceptedTokens` list (each on the registry allowlist; address(0) = ETH)
+ *      and each edition carries a base price per token. A LIMITED_DYNAMIC edition's price in every token rises by
+ *      the same rule. Proceeds are kept per token, as paid; the permissionless `distribute(token)` splits them and
+ *      only the owner withdraws its share (`withdraw(token)`, `withdrawAll()`).
  */
 // slither-disable-next-line missing-inheritance
 contract ERC1155Instance is Ownable, ReentrancyGuard, IInstanceLifecycle {
@@ -75,18 +79,20 @@ contract ERC1155Instance is Ownable, ReentrancyGuard, IInstanceLifecycle {
         address gatingModule;
         address dynamicPricingModule;
         address weth;
+        address registry;          // payment-token allowlist
+        address[] acceptedTokens;  // address(0) = ETH
     }
 
     struct Edition {
         uint256 id;
         string pieceTitle;
-        uint256 basePrice;        // Base price for dynamic pricing
         uint256 supply;           // 0 = unlimited
         uint256 minted;
         string metadataURI;
         PricingModel pricingModel;
         uint256 priceIncreaseRate; // For dynamic pricing (basis points, e.g., 100 = 1%)
         uint256 openTime;          // Unix timestamp; 0 = open immediately
+        TokenPrice[] prices;       // base price in each token the edition sells for (dynamic: the first mint's price)
     }
 
     // ┌─────────────────────────┐
@@ -99,6 +105,8 @@ contract ERC1155Instance is Ownable, ReentrancyGuard, IInstanceLifecycle {
     // slither-disable-next-line immutable-states
     address public factory;
     IAlignmentVault public immutable vault;
+    /// @notice The registry whose payment-token allowlist this collection checks.
+    address public immutable registry;
     address public immutable protocolTreasury;
     /// @notice Protocol fee (bps) snapshotted at launch; never changes.
     uint16 public immutable protocolFeeBps;
@@ -126,17 +134,14 @@ contract ERC1155Instance is Ownable, ReentrancyGuard, IInstanceLifecycle {
     bool private _freeMintInitialized;
 
     uint256 public nextEditionId;
-    uint256 public totalProceeds;  // Total ETH collected from mints
-    uint256 public totalWithdrawn; // Total ETH passed to withdraw() (prevents double-withdrawal and force-feed attacks)
-    /// @dev INVARIANT: pendingVaultCut <= address(this).balance at all times.
-    ///      Failed vault contributions stay in the contract, tracked here so they
-    ///      cannot be re-withdrawn as artist proceeds.
-    uint256 public pendingVaultCut;
-    /// @notice Protocol cuts the treasury refused, held here until it accepts them.
-    uint256 public pendingProtocolCut;
+    /// @dev Per-token accounting (PaymentLib). INVARIANT: for every token, the balance held >= what is owed.
+    PaymentLib.Ledger internal _pay;
+    /// @notice Total sale proceeds ever collected, per token.
+    mapping(address token => uint256) public totalProceeds;
 
     // Events
-    event ProtocolCutParked(uint256 amount);
+    /// @notice withdrawAll skipped `token`: its split or payout reverted. Withdraw it on its own to see why.
+    event WithdrawSkipped(address indexed token);
     event TransferSingle(
         address indexed operator,
         address indexed from,
@@ -162,29 +167,22 @@ contract ERC1155Instance is Ownable, ReentrancyGuard, IInstanceLifecycle {
     event EditionAdded(
         uint256 indexed editionId,
         string pieceTitle,
-        uint256 basePrice,
+        TokenPrice[] prices,
         uint256 supply,
         PricingModel pricingModel
     );
+    event EditionPricesSet(uint256 indexed editionId, TokenPrice[] prices);
 
     event Minted(
         address indexed to,
         uint256 indexed editionId,
         uint256 amount,
+        address token,
         uint256 totalCost
     );
 
     event MintMessage(address indexed minter, uint256 indexed editionId, string message);
 
-    event Withdrawn(
-        address indexed creator,
-        uint256 artistAmount,
-        uint256 vaultCut,
-        uint256 protocolCut
-    );
-
-    event VaultContributionFailed(address indexed vault, uint256 amount);
-    event VaultContributionRetried(address indexed vault, uint256 amount);
 
     event EditionMetadataUpdated(uint256 indexed editionId, string metadataURI);
     /// @dev ERC-1155 metadata event, which marketplaces index.
@@ -208,12 +206,15 @@ contract ERC1155Instance is Ownable, ReentrancyGuard, IInstanceLifecycle {
         if (_factory == address(0)) revert InvalidAddress();
         if (_vault == address(0)) revert InvalidAddress();
         if (uint256(_init.protocolFeeBps) + _init.alignmentBps > RevenueSplitLib.BPS) revert InvalidSplit();
+        if (_init.registry == address(0)) revert InvalidAddress();
 
         _initializeOwner(_creator);
         name = _name;
         creator = _creator;
         factory = _factory;
         vault = IAlignmentVault(payable(_vault));
+        registry = _init.registry;
+        PaymentLib.setAccepted(_pay, _init.registry, _init.acceptedTokens);
         protocolTreasury = _init.protocolTreasury;
         protocolFeeBps = _init.protocolFeeBps;
         alignmentBps = _init.alignmentBps;
@@ -249,7 +250,8 @@ contract ERC1155Instance is Ownable, ReentrancyGuard, IInstanceLifecycle {
 
     /// @notice Claim one free token of a specified edition at zero ETH cost.
     /// @param editionId  The edition to claim from. Must exist.
-    /// @param gatingData Passed to gatingModule.canMint if scope requires it.
+    /// @param gatingData abi.encode(bytes32 passwordHash), or empty for the open tier, used if scope requires it. As in
+    ///        mint(), the module gets the edition's openTime from here: a caller's value could skip a time lock.
     // slither-disable-next-line reentrancy-benign,reentrancy-no-eth,unused-return
     function claimFreeMint(uint256 editionId, bytes calldata gatingData) external nonReentrant {
         if (freeMintAllocation == 0) revert FreeMintDisabled();
@@ -266,7 +268,8 @@ contract ERC1155Instance is Ownable, ReentrancyGuard, IInstanceLifecycle {
         }
 
         if (address(gatingModule) != address(0) && gatingScope != GatingScope.PAID_ONLY) {
-            (bool allowed,) = gatingModule.canMint(msg.sender, 1, gatingData);
+            bytes32 passwordHash = gatingData.length == 0 ? bytes32(0) : abi.decode(gatingData, (bytes32));
+            (bool allowed,) = gatingModule.canMint(msg.sender, 1, abi.encode(passwordHash, edition.openTime));
             if (!allowed) revert GatingCheckFailed();
             gatingModule.onMint(msg.sender, 1);
         }
@@ -287,24 +290,24 @@ contract ERC1155Instance is Ownable, ReentrancyGuard, IInstanceLifecycle {
     /**
      * @notice Add a new edition
      * @param pieceTitle Title of the piece
-     * @param basePrice Base price (for fixed) or starting price (for dynamic)
+     * @param prices Base price per accepted token (for fixed) or starting price (for dynamic); each must be > 0
      * @param supply Supply limit (0 = unlimited)
      * @param metadataURI Metadata URI for the edition
      * @param pricingModel Pricing model (UNLIMITED, LIMITED_FIXED, LIMITED_DYNAMIC)
-     * @param priceIncreaseRate Price increase rate in basis points (for dynamic pricing)
+     * @param priceIncreaseRate Price increase rate in basis points (for dynamic pricing; applies to every token)
      */
     function addEdition(
         string memory pieceTitle,
-        uint256 basePrice,
+        TokenPrice[] memory prices,
         uint256 supply,
         string memory metadataURI,
         PricingModel pricingModel,
         uint256 priceIncreaseRate,
-        uint256 openTime           // NEW: Unix timestamp; 0 = open immediately
+        uint256 openTime           // Unix timestamp; 0 = open immediately
     ) external {
         if (msg.sender != owner()) revert Unauthorized();
         if (bytes(pieceTitle).length == 0) revert InvalidTitle();
-        if (basePrice == 0) revert InvalidPrice();
+        PaymentLib.checkPrices(_pay, prices, false);
 
         if (pricingModel == PricingModel.UNLIMITED) {
             if (supply != 0) revert UnlimitedMustHaveZeroSupply();
@@ -320,19 +323,39 @@ contract ERC1155Instance is Ownable, ReentrancyGuard, IInstanceLifecycle {
         if (nextEditionId > type(uint32).max) revert EditionLimitReached();
 
         uint256 editionId = nextEditionId++;
-        editions[editionId] = Edition({
-            id: editionId,
-            pieceTitle: pieceTitle,
-            basePrice: basePrice,
-            supply: supply,
-            minted: 0,
-            metadataURI: metadataURI,
-            pricingModel: pricingModel,
-            priceIncreaseRate: priceIncreaseRate,
-            openTime: openTime      // NEW
-        });
+        Edition storage e = editions[editionId];
+        e.id = editionId;
+        e.pieceTitle = pieceTitle;
+        e.supply = supply;
+        e.metadataURI = metadataURI;
+        e.pricingModel = pricingModel;
+        e.priceIncreaseRate = priceIncreaseRate;
+        e.openTime = openTime;
+        for (uint256 i; i < prices.length; ++i) {
+            e.prices.push(prices[i]);
+        }
 
-        emit EditionAdded(editionId, pieceTitle, basePrice, supply, pricingModel);
+        emit EditionAdded(editionId, pieceTitle, prices, supply, pricingModel);
+    }
+
+    /// @notice Replace an edition's base prices (each token accepted, each price > 0). A dynamic edition keeps its
+    ///         position on the curve: the new base prices rise from the pieces already minted.
+    function setEditionPrices(uint256 editionId, TokenPrice[] calldata prices) external {
+        if (msg.sender != owner()) revert Unauthorized();
+        Edition storage e = editions[editionId];
+        if (e.id == 0) revert EditionNotFound();
+        PaymentLib.checkPrices(_pay, prices, false);
+        while (e.prices.length != 0) e.prices.pop();
+        for (uint256 i; i < prices.length; ++i) {
+            e.prices.push(prices[i]);
+        }
+        emit EditionPricesSet(editionId, prices);
+    }
+
+    /// @notice Replace the accepted tokens (each on the registry allowlist). Balances already held in a removed
+    ///         token stay withdrawable; editions can only sell for accepted tokens.
+    function setAcceptedTokens(address[] calldata tokens) external onlyOwner {
+        PaymentLib.setAccepted(_pay, registry, tokens);
     }
 
     /**
@@ -353,48 +376,54 @@ contract ERC1155Instance is Ownable, ReentrancyGuard, IInstanceLifecycle {
     // │   Pricing Functions    │
     // └─────────────────────────┘
 
-    /**
-     * @notice Get current price for an edition
-     * @param editionId Edition ID
-     * @return price Current price for the next mint
-     */
-    function getCurrentPrice(uint256 editionId) public view returns (uint256 price) {
+    /// @notice Base price of an edition in `token`; `priced` is false if the edition doesn't sell for it.
+    function priceOf(uint256 editionId, address token) public view returns (bool priced, uint256 price) {
         Edition storage edition = editions[editionId];
         if (edition.id == 0) revert EditionNotFound();
+        return PaymentLib.priceIn(edition.prices, token);
+    }
+
+    /**
+     * @notice Get current price for an edition in `token`
+     * @param editionId Edition ID
+     * @param token Payment token (address(0) = ETH)
+     * @return price Current price for the next mint
+     */
+    function getCurrentPrice(uint256 editionId, address token) public view returns (uint256 price) {
+        Edition storage edition = editions[editionId];
+        (bool priced, uint256 basePrice) = priceOf(editionId, token);
+        if (!priced) revert TokenNotPriced();
 
         if (edition.pricingModel == PricingModel.UNLIMITED || edition.pricingModel == PricingModel.LIMITED_FIXED) {
-            return edition.basePrice;
+            return basePrice;
         } else {
             // LIMITED_DYNAMIC
-            return dynamicPricingModule.calculatePrice(
-                edition.basePrice,
-                edition.priceIncreaseRate,
-                edition.minted
-            );
+            return dynamicPricingModule.calculatePrice(basePrice, edition.priceIncreaseRate, edition.minted);
         }
     }
 
     /**
-     * @notice Calculate total cost for minting multiple tokens
+     * @notice Calculate total cost in `token` for minting multiple tokens
      * @param editionId Edition ID
      * @param amount Number of tokens to mint
+     * @param token Payment token (address(0) = ETH)
      * @return totalCost Total cost for minting the amount
      */
-    function calculateMintCost(uint256 editionId, uint256 amount) public view returns (uint256 totalCost) {
+    function calculateMintCost(uint256 editionId, uint256 amount, address token)
+        public
+        view
+        returns (uint256 totalCost)
+    {
         Edition storage edition = editions[editionId];
-        if (edition.id == 0) revert EditionNotFound();
         if (amount == 0) revert AmountMustBePositive();
+        (bool priced, uint256 basePrice) = priceOf(editionId, token);
+        if (!priced) revert TokenNotPriced();
 
         if (edition.pricingModel == PricingModel.UNLIMITED || edition.pricingModel == PricingModel.LIMITED_FIXED) {
-            return edition.basePrice * amount;
+            return basePrice * amount;
         } else {
             // LIMITED_DYNAMIC
-            return dynamicPricingModule.calculateBatchCost(
-                edition.basePrice,
-                edition.priceIncreaseRate,
-                edition.minted,
-                amount
-            );
+            return dynamicPricingModule.calculateBatchCost(basePrice, edition.priceIncreaseRate, edition.minted, amount);
         }
     }
 
@@ -403,18 +432,21 @@ contract ERC1155Instance is Ownable, ReentrancyGuard, IInstanceLifecycle {
     // └─────────────────────────┘
 
     /**
-     * @notice Mint tokens with optional message
+     * @notice Mint tokens with optional message, paying in `token`
      * @param editionId Edition ID
      * @param amount Number of tokens to mint
      * @param message Optional message shown alongside the mint (empty string emits nothing)
-     * @param maxCost Maximum acceptable total cost (0 = no limit, uses msg.value as implicit cap)
+     * @param token Payment token (address(0) = ETH): accepted by this collection and on the registry allowlist
+     * @param maxCost Maximum acceptable total cost in `token`. ETH: 0 = no limit (msg.value caps it) and any excess
+     *        msg.value is refunded. ERC-20: required; exactly the cost is pulled (msg.value must be 0).
      */
     // slither-disable-next-line reentrancy-benign,reentrancy-no-eth,timestamp,unused-return
     function mint(
         uint256 editionId,
         uint256 amount,
-        bytes32 gatingData,        // NEW: password hash (bytes32(0) = open tier)
+        bytes32 gatingData,        // password hash (bytes32(0) = open tier)
         string calldata message,
+        address token,
         uint256 maxCost
     ) external payable nonReentrant {
         Edition storage edition = editions[editionId];
@@ -427,7 +459,7 @@ contract ERC1155Instance is Ownable, ReentrancyGuard, IInstanceLifecycle {
         }
 
         // Gating check — forwards edition's openTime as the time reference
-        if (address(gatingModule) != address(0)) {
+        if (address(gatingModule) != address(0) && gatingScope != GatingScope.FREE_MINT_ONLY) {
             bytes memory encoded = abi.encode(gatingData, edition.openTime);
             (bool allowed,) = gatingModule.canMint(msg.sender, amount, encoded);
             if (!allowed) revert GatingCheckFailed();
@@ -440,22 +472,30 @@ contract ERC1155Instance is Ownable, ReentrancyGuard, IInstanceLifecycle {
         }
 
         // Calculate cost
-        uint256 totalCost = calculateMintCost(editionId, amount);
-        if (maxCost != 0 && totalCost > maxCost) revert ExceedsMaxCost();
-        if (msg.value < totalCost) revert InsufficientPayment();
+        PaymentLib.checkUsable(_pay, registry, token);
+        uint256 totalCost = calculateMintCost(editionId, amount, token);
+        if (token == PaymentLib.ETH) {
+            if (maxCost != 0 && totalCost > maxCost) revert ExceedsMaxCost();
+            if (msg.value < totalCost) revert InsufficientPayment();
+        } else {
+            if (msg.value != 0) revert WrongPayment();
+            if (totalCost > maxCost) revert ExceedsMaxCost();
+            PaymentLib.collect(token, totalCost);
+        }
 
         // Update edition state
         edition.minted += amount;
         balanceOf[msg.sender][editionId] += amount;
-        totalProceeds += totalCost;
+        totalProceeds[token] += totalCost;
+        _pay.unsplit[token] += totalCost;
 
         // Refund excess
-        if (msg.value > totalCost) {
+        if (token == PaymentLib.ETH && msg.value > totalCost) {
             SmartTransferLib.smartTransferETH(msg.sender, msg.value - totalCost, weth);
         }
 
         emit TransferSingle(msg.sender, address(0), msg.sender, editionId, amount);
-        emit Minted(msg.sender, editionId, amount, totalCost);
+        emit Minted(msg.sender, editionId, amount, token, totalCost);
         if (bytes(message).length > 0) emit MintMessage(msg.sender, editionId, message);
     }
 
@@ -463,111 +503,140 @@ contract ERC1155Instance is Ownable, ReentrancyGuard, IInstanceLifecycle {
     // │   Withdraw Functions    │
     // └─────────────────────────┘
 
-    /**
-     * @notice Withdraw proceeds, split between protocol treasury, alignment vault and artist
-     * @dev Uses the protocolFeeBps / alignmentBps snapshotted at launch; the artist gets the remainder.
-     * @param amount Amount to withdraw
-     */
-    function withdraw(uint256 amount) external nonReentrant {
-        if (amount == 0) revert AmountMustBePositive();
-        // Use proceeds accounting to prevent force-fed ETH from bypassing the split
-        if (amount > totalProceeds - totalWithdrawn) revert InsufficientBalance();
-        totalWithdrawn += amount;
+    /// @notice Split the proceeds held in `token`: protocol cut to the treasury, vault cut to the vault (both
+    ///         parked if refused), the rest to the owner's balance. Callable by anyone, so the cuts never wait on the
+    ///         artist.
+    function distribute(address token) external nonReentrant {
+        if (!_distribute(token)) revert AmountMustBePositive();
+    }
 
-        RevenueSplitLib.Split memory s = RevenueSplitLib.split(amount, protocolFeeBps, alignmentBps);
+    /// @notice Pay the owner its balance of `token` (address(0) = ETH), splitting any unsplit proceeds first.
+    function withdraw(address token) external onlyOwner nonReentrant {
+        bool split = _distribute(token);
+        if (PaymentLib.payOwner(_pay, token, owner(), weth) == 0 && !split) revert InsufficientBalance();
+    }
 
-        // Protocol cut to treasury
-        if (protocolTreasury != address(0)) _payProtocol(s.protocolCut);
-
-        // Vault cut — tracks this instance as benefactor
-        // If the vault reverts (e.g. broken upgrade), accumulate for retry rather than
-        // blocking creator proceeds permanently.
-        // Parked cuts go with this one, so small ones add up past the vault's minimum.
-        uint256 cut = s.vaultCut + pendingVaultCut;
-        uint256 vaultCutSent;
-        if (cut > 0) {
-            pendingVaultCut = 0;
-            try vault.receiveContribution{value: cut}(Currency.wrap(address(0)), cut, address(this)) {
-                vaultCutSent = cut;
+    /// @notice `withdraw` for every token this collection has ever accepted.
+    function withdrawAll() external onlyOwner nonReentrant {
+        address[] storage known = _pay.known;
+        bool any;
+        for (uint256 i; i < known.length; ++i) {
+            // One token that can't split or pay out (a refusing vault, a blocklisted owner) is skipped, not fatal.
+            try this.withdrawAllStep(known[i]) returns (bool did) {
+                if (did) any = true;
             } catch {
-                pendingVaultCut = cut;
-                emit VaultContributionFailed(address(vault), cut);
+                emit WithdrawSkipped(known[i]);
             }
         }
-
-        // Transfer remainder to artist
-        SmartTransferLib.smartTransferETH(owner(), s.remainder, weth);
-
-        emit Withdrawn(owner(), s.remainder, vaultCutSent, s.protocolCut);
+        if (!any) revert InsufficientBalance();
     }
 
-    /// @dev Pay the treasury this cut and anything parked. A treasury that refuses is never a reason to hold up a sale.
-    function _payProtocol(uint256 amount) private {
-        uint256 total = amount + pendingProtocolCut;
-        if (total == 0) return;
-        pendingProtocolCut = 0;
-        if (!SafeTransferLib.trySafeTransferETH(protocolTreasury, total, SafeTransferLib.GAS_STIPEND_NO_GRIEF)) {
-            pendingProtocolCut = total;
-            emit ProtocolCutParked(total);
-        }
+    /// @notice withdrawAll's step for one token. Only this contract can call it (inside withdrawAll's guard).
+    function withdrawAllStep(address token) external returns (bool did) {
+        if (msg.sender != address(this)) revert Unauthorized();
+        did = _distribute(token);
+        if (PaymentLib.payOwner(_pay, token, owner(), weth) != 0) did = true;
     }
 
-    /// @notice Retry paying protocol cuts the treasury previously refused. Anyone can call this.
-    function flushPendingProtocolCut() external nonReentrant {
-        uint256 pending = pendingProtocolCut;
-        if (pending == 0) revert NoPendingProtocolCut();
-        pendingProtocolCut = 0;
-        SafeTransferLib.safeTransferETH(protocolTreasury, pending);
+    function _distribute(address token) internal returns (bool) {
+        uint256 amount = _pay.unsplit[token];
+        if (amount == 0) return false;
+        _pay.unsplit[token] = 0;
+        PaymentLib.split(
+            _pay,
+            PaymentLib.Terms({
+                vault: address(vault),
+                treasury: protocolTreasury,
+                protocolBps: protocolFeeBps,
+                alignmentBps: alignmentBps
+            }),
+            token,
+            amount
+        );
+        return true;
     }
 
-    /// @notice Count ETH that reached this contract outside a mint as proceeds, so withdraw() can split it.
-    function sweepUntrackedETH() external nonReentrant {
-        uint256 untracked =
-            address(this).balance - (totalProceeds - totalWithdrawn) - pendingVaultCut - pendingProtocolCut;
+    /// @notice Retry paying protocol cuts in `token` the treasury previously refused. Anyone can call this.
+    function flushPendingProtocolCut(address token) external nonReentrant {
+        PaymentLib.flushProtocol(_pay, protocolTreasury, token);
+    }
+
+    /// @notice Count `token` that reached this contract outside a mint as proceeds, so the next split shares it.
+    ///         Only tokens this collection has accepted. Anyone can call this.
+    function sweepUntracked(address token) external nonReentrant {
+        if (!_pay.isKnown[token]) revert PaymentLib.TokenNotAccepted(token);
+        uint256 untracked = PaymentLib.untracked(_pay, token);
         if (untracked == 0) revert AmountMustBePositive();
-        totalProceeds += untracked;
+        totalProceeds[token] += untracked;
+        _pay.unsplit[token] += untracked;
     }
 
     /**
-     * @notice Retry sending any accumulated failed vault contributions.
-     * @dev Permissionless — anyone can call once the vault is restored.
+     * @notice Retry sending the vault cuts in `token` the vault previously rejected.
+     * @dev Permissionless — anyone can call once the vault is restored. A parked cut under the vault's minimum
+     *      (e.g. the last split of a sold-out collection) can be topped up by `topUp` (ETH: msg.value == topUp; an
+     *      ERC-20 is pulled from the caller): all of it goes to the vault, credited to this collection like the cut,
+     *      and a total still under the minimum reverts, which returns the top-up.
      */
-    function retryVaultContribution() external nonReentrant {
-        uint256 pending = pendingVaultCut;
-        if (pending == 0) revert NoPendingVaultCut();
-        pendingVaultCut = 0;
-        vault.receiveContribution{value: pending}(Currency.wrap(address(0)), pending, address(this));
-        emit VaultContributionRetried(address(vault), pending);
+    function flushPendingVaultCut(address token, uint256 topUp) external payable nonReentrant {
+        PaymentLib.flushVault(_pay, address(vault), token, topUp);
+    }
+
+    // ── Payment views ─────────────────────────────────────────────────────────
+
+    function acceptedTokens() external view returns (address[] memory) {
+        return _pay.accepted;
+    }
+
+    /// @notice Every token this collection has ever accepted (withdrawAll walks these).
+    function knownTokens() external view returns (address[] memory) {
+        return _pay.known;
+    }
+
+    function isAcceptedToken(address token) external view returns (bool) {
+        return _pay.isAccepted[token];
+    }
+
+    /// @notice Sale proceeds in `token` not yet split.
+    function unsplitProceeds(address token) external view returns (uint256) {
+        return _pay.unsplit[token];
+    }
+
+    /// @notice The owner's withdrawable balance of `token` (excludes unsplit proceeds).
+    function ownerBalance(address token) external view returns (uint256) {
+        return _pay.ownerOwed[token];
+    }
+
+    function pendingVaultCut(address token) external view returns (uint256) {
+        return _pay.vaultOwed[token];
+    }
+
+    function pendingProtocolCut(address token) external view returns (uint256) {
+        return _pay.protocolOwed[token];
     }
 
     /**
-     * @notice Claim accumulated vault fees on behalf of this project and distribute to creator
-     * @dev Only callable by the project creator
-     *      This instance was registered as the benefactor when tithes were sent to the vault
-     *      The creator calls this to claim fees and keep the rewards
-     * @dev Vault contributions (via withdraw) wait in the vault's open batch and earn shares when the keeper next
-     *      converts. Fees can only be claimed after that.
-     * @return totalClaimed Amount of ETH claimed from vault
+     * @notice Claim this collection's vault fees in `mode` and forward what the vault pays (INFER, IMD, ETH) to the
+     *         owner. `minEthOut` is the floor for ClaimMode.ETH.
+     * @dev Vault contributions wait in the vault's open batch and earn shares when the keeper next converts. Fees
+     *      can only be claimed after that.
      */
-    function claimVaultFees() external onlyOwner nonReentrant returns (uint256 totalClaimed) {
-        // Call vault's claimFees, which uses msg.sender (this contract) as the benefactor
-        totalClaimed = vault.claimFees();
-
-        // Route all claimed fees to the owner
-        if (totalClaimed == 0) revert NoFeesToClaim();
-        SmartTransferLib.smartTransferETH(owner(), totalClaimed, weth);
+    function claimVaultFees(ClaimMode mode, uint256 minEthOut)
+        external
+        onlyOwner
+        nonReentrant
+        returns (uint256 inferOut, uint256 imdOut, uint256 ethOut)
+    {
+        return PaymentLib.claimVaultFees(address(vault), mode, minEthOut, owner(), weth, true);
     }
 
-    /// @notice Claim accumulated fees from this instance's vault (fixed at launch) and forward them to the owner.
-    /// @dev With a single fixed vault this is equivalent to claimVaultFees(); kept for IFactoryInstance.
+    /// @notice Claim this instance's vault fees as tokens and forward them to the owner (IFactoryInstance).
     function claimAllFees() external onlyOwner nonReentrant {
-        uint256 claimed = vault.claimFees();
-        if (claimed > 0) SmartTransferLib.smartTransferETH(owner(), claimed, weth);
+        PaymentLib.claimVaultFees(address(vault), ClaimMode.TOKENS, 0, owner(), weth, false);
     }
 
-    /// @notice Accept ETH from the vault when it pays out claimed fees (UniAlignmentVault.claimFees pays the
-    ///         benefactor with a plain call); claimVaultFees() forwards it to the owner. ETH from anywhere else
-    ///         stays out of the split until sweepUntrackedETH() counts it.
+    /// @notice Accept ETH from the vault when it pays out claimed fees; claimVaultFees() forwards it to the owner.
+    ///         ETH from anywhere else stays out of the split until sweepUntracked(address(0)) counts it.
     receive() external payable {}
 
     // ┌─────────────────────────┐
@@ -707,7 +776,7 @@ contract ERC1155Instance is Ownable, ReentrancyGuard, IInstanceLifecycle {
     // │   Style Management      │
     // └─────────────────────────┘
 
-    /// @notice Disabled: the artist's share of every withdraw is sent to owner(), so renouncing would burn it.
+    /// @notice Disabled: the artist's share of every split is owed to owner(), so renouncing would strand it.
     function renounceOwnership() public payable override onlyOwner {
         revert RenounceDisabled();
     }
